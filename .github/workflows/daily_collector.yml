@@ -3,8 +3,10 @@ name: 1. Kinopoisk Daily Collector
 on:
   workflow_dispatch:
   schedule:
-    # Запуск каждый день в 9:20 по UTC (12:20 по МСК)
-    - cron: '20 9 * * *'
+    # ИЗМЕНЕНО: Запуск в 9:00 и 21:00 по UTC.
+    # Это соответствует 12:00 и 00:00 по МСК.
+    # Если нужно точно в 9 и 21 по МСК (UTC+3), используйте '0 6,18 * * *'
+    - cron: '0 9,21 * * *'
 
 jobs:
   parse-and-upload:
@@ -33,7 +35,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kinopoisk-raw-data-chunk
-          # ИСПРАВЛЕНО: Убрана опечатка в названии переменной
           path: ${{ env.ARTIFACT_CHUNK_PATH }}
 
       - name: Upload log artifact
@@ -42,3 +43,5 @@ jobs:
         with:
           name: daily-collector-logs
           path: ${{ env.LOG_FILE_PATH }}
+
+
