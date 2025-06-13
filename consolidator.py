@@ -48,18 +48,23 @@ def main():
     hf_token = get_required_env_var("HF_TOKEN")
     api = HfApi()
 
-    logging.info("Fetching list of raw data files...")
+    logging.info("Fetching list of all files from the dataset...")
     try:
-        raw_files = list_repo_files(
-            repo_id=DATASET_ID, repo_type="dataset",
-            token=hf_token, paths=[RAW_DATA_DIR]
+        # --- ИЗМЕНЕНИЕ: Получаем все файлы, а затем фильтруем ---
+        all_repo_files = list_repo_files(
+            repo_id=DATASET_ID,
+            repo_type="dataset",
+            token=hf_token
         )
+        # Фильтруем, чтобы оставить только файлы из нужной директории
+        raw_files = [f for f in all_repo_files if f.startswith(f"{RAW_DATA_DIR}/")]
+
     except Exception as e:
-        logging.critical(f"Could not list repo files. Does '{RAW_DATA_DIR}' directory exist? Error: {e}")
+        logging.critical(f"Could not list repo files. Error: {e}", exc_info=True)
         sys.exit(1)
 
     if not raw_files:
-        logging.warning("No raw data files found to consolidate. Exiting.")
+        logging.warning(f"No files found in the '{RAW_DATA_DIR}' directory. Exiting.")
         sys.exit(0)
 
     logging.info(f"Found {len(raw_files)} raw files. Starting deduplication...")
@@ -123,3 +128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
