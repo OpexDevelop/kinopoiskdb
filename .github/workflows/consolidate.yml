@@ -4,12 +4,10 @@ on:
   # Оставляем возможность ручного запуска
   workflow_dispatch:
 
-  # ДОБАВЛЕНО: Автоматический запуск после успешного завершения сборщика
+  # Запуск после успешного завершения сборщика
   workflow_run:
-    # Название воркфлоу, за которым мы следим.
-    # Должно в точности совпадать с полем 'name' в daily_collector.yml
-    workflows: ["1. Kinopoisk Daily Collector"]
-    # Тип события - завершение
+    # ИЗМЕНЕНО: Имя воркфлоу должно совпадать с именем из daily_collector.yml
+    workflows: ["1. Kinopoisk Data Collector"]
     types:
       - completed
 
@@ -17,7 +15,7 @@ jobs:
   # Запускаем консолидацию, только если сборщик завершился УСПЕШНО
   consolidate:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360 # 6 часов
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
@@ -28,6 +26,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install requests huggingface_hub
