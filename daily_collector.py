@@ -15,10 +15,10 @@ HF_USERNAME = "opex792"
 DATASET_ID = f"{HF_USERNAME}/kinopoisk"
 METADATA_FILENAME = "_metadata.json"
 RAW_DATA_DIR = "raw_data"
-MAX_REQUESTS_PER_RUN = 2 #200
+MAX_REQUESTS_PER_RUN = 2 #100
 API_BASE_URL = "https://api.kinopoisk.dev/v1.4/movie"
-REQUEST_TIMEOUT_SECONDS = 240 
-MAX_RETRIES = 10 
+REQUEST_TIMEOUT_SECONDS = 240
+MAX_RETRIES = 10
 
 # --- Настройка логирования ---
 log_filename = f"log_daily_collector_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
@@ -31,7 +31,19 @@ logging.basicConfig(
     ]
 )
 
+def format_size(size_bytes):
+    """Форматирует размер в байтах в КБ, МБ или ГБ для логов."""
+    if size_bytes is None:
+        return "N/A"
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024**2:
+        return f"{size_bytes/1024:.2f} KB"
+    else:
+        return f"{size_bytes/1024**2:.2f} MB"
+
 def get_required_env_var(var_name):
+    """Получает переменную окружения, прекращая работу, если она не установлена."""
     value = os.getenv(var_name)
     if not value:
         logging.critical(f"Error: Environment variable {var_name} is not set.")
@@ -39,6 +51,10 @@ def get_required_env_var(var_name):
     return value
 
 def get_start_page(token):
+    """
+    Получает номер последней успешной страницы из метаданных в репозитории.
+    Начинает с 1, если метаданные не найдены.
+    """
     try:
         logging.info(f"Attempting to download metadata file: {METADATA_FILENAME}")
         metadata_path = hf_hub_download(
@@ -47,7 +63,7 @@ def get_start_page(token):
             repo_type="dataset",
             token=token
         )
-        with open(metadata_path, 'r') as f:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
         last_page = metadata.get("last_successful_page", 0)
         logging.info(f"Found metadata. Last successful page was {last_page}. Starting from {last_page + 1}.")
@@ -64,6 +80,7 @@ def get_start_page(token):
         sys.exit(1)
 
 def fetch_page_with_retries(page, api_key):
+    """Запрашивает страницу API с несколькими попытками и экспоненциальной задержкой."""
     params = [
         ('page', page), ('limit', 250),
         ('sortField', 'votes.kp'), ('sortField', 'votes.imdb'), ('sortField', 'rating.imdb'),
@@ -71,14 +88,25 @@ def fetch_page_with_retries(page, api_key):
         ('selectFields', '')
     ]
     headers = {"X-API-KEY": api_key}
-    
+
     for attempt in range(MAX_RETRIES):
         try:
             logging.info(f"Requesting page {page}, attempt {attempt + 1}/{MAX_RETRIES}...")
             response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-            logging.info(f"Page {page}: Received status code {response.status_code}. Content-Length: {response.headers.get('Content-Length')}")
+            
+            # ИЗМЕНЕНИЕ: Считаем размер фактического тела ответа, а не заголовок
+            payload_size = len(response.content)
+            logging.info(f"Page {page}: Received status code {response.status_code}. Payload size: {format_size(payload_size)}")
+            
             response.raise_for_status()
+            
+            # Проверяем, что ответ не пустой, прежде чем декодировать JSON
+            if not payload_size:
+                logging.warning(f"Page {page}: Received an empty response body. Skipping.")
+                return None
+            
             return response.json()
+            
         except requests.exceptions.RequestException as e:
             logging.warning(f"Page {page}, attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
@@ -88,52 +116,61 @@ def fetch_page_with_retries(page, api_key):
             else:
                 logging.error(f"All {MAX_RETRIES} retries for page {page} failed.")
                 raise
+        except json.JSONDecodeError as e:
+            logging.error(f"Page {page}: Failed to decode JSON from response. Error: {e}")
+            # Не повторяем попытку при ошибке JSON, т.к. ответ скорее всего битый
+            raise
+
     return None
 
 def main():
+    """Основная функция для сбора данных."""
     if os.getenv("GITHUB_ACTIONS"):
-        with open(os.environ['GITHUB_ENV'], 'a') as f:
+        with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
             f.write(f"LOG_FILE_PATH={log_filename}\n")
 
     kinopoisk_api_key = get_required_env_var("KINOPOISK_API_KEY")
     hf_token = get_required_env_var("HF_TOKEN")
-    
+
     api = HfApi()
-    
+
     logging.info(f"Ensuring dataset '{DATASET_ID}' exists...")
     api.create_repo(repo_id=DATASET_ID, repo_type="dataset", token=hf_token, exist_ok=True)
     logging.info("Dataset check complete.")
-    
+
     start_page = get_start_page(hf_token)
     current_page = start_page
     last_successful_page = start_page - 1
     pages_processed = 0
     total_api_pages = float('inf')
-    
+
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
-    
+
     temp_archive_path = None
     gzip_file = None
 
     try:
         while pages_processed < MAX_REQUESTS_PER_RUN:
-            # --- ИЗМЕНЕНИЕ: Логика бесконечного цикла ---
             if 'total_api_pages' in locals() and current_page > total_api_pages and total_api_pages != float('inf'):
                 logging.info(f"Reached the end of available pages ({total_api_pages}). Looping back to page 1 for updates.")
                 current_page = 1
-            
+
             data = fetch_page_with_retries(current_page, kinopoisk_api_key)
             if data is None:
-                logging.critical(f"Could not fetch page {current_page} after all retries. Aborting run.")
-                sys.exit(1)
+                # Логируем, что страница была пропущена, и продолжаем
+                logging.warning(f"Skipping page {current_page} due to fetch/decode errors after all retries.")
+                last_successful_page = current_page # Считаем страницу обработанной, чтобы не застрять
+                pages_processed += 1
+                current_page += 1
+                continue
 
             if pages_processed == 0:
                 total_api_pages = data.get('pages', total_api_pages)
                 logging.info(f"Total pages available in API: {total_api_pages}")
-                
+
                 end_page_in_run = start_page + MAX_REQUESTS_PER_RUN - 1
-                date_str = datetime.utcnow().strftime('%Y-%m-%d')
+                date_str = datetime.utcnow().strftime('%Y-%m-%d_%H-%M')
                 archive_filename = f"part_{date_str}_{start_page:05d}-{end_page_in_run:05d}.jsonl.gz"
                 temp_archive_path = output_dir / archive_filename
                 gzip_file = gzip.open(temp_archive_path, 'wt', encoding='utf-8')
@@ -145,7 +182,7 @@ def main():
                     gzip_file.write(json.dumps(movie, ensure_ascii=False) + '\n')
             else:
                 logging.warning(f"Page {current_page}: 'docs' key not found or is empty in the response.")
-            
+
             last_successful_page = current_page
             pages_processed += 1
             current_page += 1
@@ -157,13 +194,13 @@ def main():
         if gzip_file:
             gzip_file.close()
 
-    if pages_processed == 0:
-        logging.info("No new pages were processed. Exiting successfully.")
+    if pages_processed == 0 or temp_archive_path is None or not temp_archive_path.exists() or temp_archive_path.stat().st_size == 0:
+        logging.info("No new data was collected in this run. Exiting successfully.")
         sys.exit(0)
 
     logging.info(f"\nProcessing finished. Total pages processed in this run: {pages_processed}.")
     logging.info(f"Last successfully processed page: {last_successful_page}.")
-        
+
     logging.info(f"Uploading {temp_archive_path.name} to dataset...")
     api.upload_file(
         path_or_fileobj=str(temp_archive_path),
@@ -173,7 +210,7 @@ def main():
 
     new_metadata = {"last_successful_page": last_successful_page}
     local_metadata_path = output_dir / METADATA_FILENAME
-    with open(local_metadata_path, 'w') as f:
+    with open(local_metadata_path, 'w', encoding='utf-8') as f:
         json.dump(new_metadata, f)
 
     logging.info(f"Uploading {METADATA_FILENAME} to dataset...")
@@ -183,12 +220,14 @@ def main():
         repo_id=DATASET_ID, repo_type="dataset", token=hf_token,
         commit_message=f"Update metadata to page {last_successful_page}"
     )
-    
+
     if os.getenv("GITHUB_ACTIONS"):
-        with open(os.environ['GITHUB_ENV'], 'a') as f:
+        with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
             f.write(f"ARTIFACT_CHUNK_PATH={temp_archive_path}\n")
 
     logging.info("\nDaily collection run completed successfully.")
 
 if __name__ == "__main__":
     main()
+
+
