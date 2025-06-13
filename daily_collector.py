@@ -6,22 +6,23 @@ import sys
 import time
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 
-# --- Конфигурация ---
+# --- КОНФИГУРАЦИЯ ---
 HF_USERNAME = "opex792"
 DATASET_ID = f"{HF_USERNAME}/kinopoisk"
-METADATA_FILENAME = "_metadata.json"
+METADATA_FILENAME = "_metadata_collector_state.json"
 RAW_DATA_DIR = "raw_data"
-MAX_REQUESTS_PER_RUN = 100
+MAX_REQUESTS_PER_RUN = 30 # Безопасный лимит: 6 запусков * 30 запросов = 180/день < 200
 API_BASE_URL = "https://api.kinopoisk.dev/v1.4/movie"
 REQUEST_TIMEOUT_SECONDS = 240
 MAX_RETRIES = 10
+DEFAULT_START_DATE_ISO = "1970-01-01T00:00:00.000Z"
 
-# --- Настройка логирования ---
-log_filename = f"log_daily_collector_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
+log_filename = f"log_collector_{datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -31,17 +32,6 @@ logging.basicConfig(
     ]
 )
 
-def format_size(size_bytes):
-    """Форматирует размер в байтах в КБ, МБ или ГБ для логов."""
-    if size_bytes is None:
-        return "N/A"
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024**2:
-        return f"{size_bytes/1024:.2f} KB"
-    else:
-        return f"{size_bytes/1024**2:.2f} MB"
-
 def get_required_env_var(var_name):
     """Получает переменную окружения, прекращая работу, если она не установлена."""
     value = os.getenv(var_name)
@@ -50,59 +40,73 @@ def get_required_env_var(var_name):
         sys.exit(1)
     return value
 
-def get_start_page(token):
+def get_collector_state(token):
     """
-    Получает номер последней успешной страницы из метаданных в репозитории.
-    Начинает с 1, если метаданные не найдены.
+    Получает состояние сборщика из репозитория (последнюю дату обновления в формате ISO).
     """
     try:
-        logging.info(f"Attempting to download metadata file: {METADATA_FILENAME}")
+        logging.info(f"Attempting to download collector state file: {METADATA_FILENAME}")
         metadata_path = hf_hub_download(
             repo_id=DATASET_ID,
             filename=METADATA_FILENAME,
             repo_type="dataset",
-            token=token
+            token=token,
+            cache_dir="hf_cache"
         )
         with open(metadata_path, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
-        last_page = metadata.get("last_successful_page", 0)
-        logging.info(f"Found metadata. Last successful page was {last_page}. Starting from {last_page + 1}.")
-        return last_page + 1
+        
+        last_date = metadata.get("last_processed_update_iso", DEFAULT_START_DATE_ISO)
+        logging.info(f"Found state. Last processed update date was {last_date}.")
+        return last_date
     except HfHubHTTPError as e:
         if e.response.status_code == 404:
-            logging.warning("Metadata file not found. This must be the first run. Starting from page 1.")
-            return 1
+            logging.warning("Collector state file not found. Starting from the beginning.")
+            return DEFAULT_START_DATE_ISO
         else:
-            logging.error(f"An HTTP error occurred while fetching metadata: {e}")
+            logging.error(f"An HTTP error occurred while fetching state: {e}")
             sys.exit(1)
     except Exception as e:
-        logging.critical(f"An unexpected error occurred while fetching metadata: {e}")
+        logging.critical(f"An unexpected error occurred while fetching state: {e}")
         sys.exit(1)
 
-def fetch_page_with_retries(page, api_key):
-    """Запрашивает страницу API с несколькими попытками и экспоненциальной задержкой."""
-    params = [
-        ('page', page), ('limit', 250),
-        ('sortField', 'votes.kp'), ('sortField', 'votes.imdb'), ('sortField', 'rating.imdb'),
-        ('sortType', -1), ('sortType', -1), ('sortType', -1),
-        ('selectFields', '')
-    ]
+def fetch_page_with_retries(page, api_key, start_date_iso):
+    """
+    Запрашивает страницу API с фильтрацией по дате обновления в формате ДД.ММ.ГГГГ.
+    """
+    # ИСПРАВЛЕНО: Преобразуем дату из формата ISO (в котором мы ее храним)
+    # в формат ДД.ММ.ГГГГ, который требует API.
+    try:
+        start_dt_object = datetime.fromisoformat(start_date_iso.replace('Z', '+00:00'))
+        start_date_dmy = start_dt_object.strftime('%d.%m.%Y')
+    except ValueError:
+        logging.error(f"Could not parse date: {start_date_iso}. Using default start date.")
+        start_date_dmy = "01.01.1970"
+
+    end_date_dmy = "31.12.2099" # Конечная дата для диапазона
+    
+    params = {
+        'page': page,
+        'limit': 250,
+        'sortField': 'updatedAt',
+        'sortType': '1',
+        'updatedAt': f"{start_date_dmy}-{end_date_dmy}",
+        'selectFields': ''
+    }
     headers = {"X-API-KEY": api_key}
 
     for attempt in range(MAX_RETRIES):
         try:
-            logging.info(f"Requesting page {page}, attempt {attempt + 1}/{MAX_RETRIES}...")
+            # Логируем с каким диапазоном дат ушел запрос
+            logging.info(f"Requesting page {page} with updatedAt={params['updatedAt']} (attempt {attempt + 1}/{MAX_RETRIES})...")
             response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-            
-            # ИЗМЕНЕНИЕ: Считаем размер фактического тела ответа, а не заголовок
-            payload_size = len(response.content)
-            logging.info(f"Page {page}: Received status code {response.status_code}. Payload size: {format_size(payload_size)}")
-            
             response.raise_for_status()
             
-            # Проверяем, что ответ не пустой, прежде чем декодировать JSON
+            payload_size = len(response.content)
+            logging.info(f"Page {page}: Received status code {response.status_code}. Payload size: {payload_size / 1024:.2f} KB")
+
             if not payload_size:
-                logging.warning(f"Page {page}: Received an empty response body. Skipping.")
+                logging.warning(f"Page {page}: Received an empty response body. Assuming end of data.")
                 return None
             
             return response.json()
@@ -117,115 +121,106 @@ def fetch_page_with_retries(page, api_key):
                 logging.error(f"All {MAX_RETRIES} retries for page {page} failed.")
                 raise
         except json.JSONDecodeError as e:
-            logging.error(f"Page {page}: Failed to decode JSON from response. Error: {e}")
-            # Не повторяем попытку при ошибке JSON, т.к. ответ скорее всего битый
+            logging.error(f"Page {page}: Failed to decode JSON from response. Error: {e}", exc_info=True)
             raise
 
     return None
 
 def main():
-    """Основная функция для сбора данных."""
     if os.getenv("GITHUB_ACTIONS"):
         with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
             f.write(f"LOG_FILE_PATH={log_filename}\n")
 
     kinopoisk_api_key = get_required_env_var("KINOPOISK_API_KEY")
     hf_token = get_required_env_var("HF_TOKEN")
-
     api = HfApi()
 
-    logging.info(f"Ensuring dataset '{DATASET_ID}' exists...")
+    logging.info(f"Ensuring dataset repo '{DATASET_ID}' exists...")
     api.create_repo(repo_id=DATASET_ID, repo_type="dataset", token=hf_token, exist_ok=True)
-    logging.info("Dataset check complete.")
+    logging.info("Dataset repo check complete.")
 
-    start_page = get_start_page(hf_token)
-    current_page = start_page
-    last_successful_page = start_page - 1
-    pages_processed = 0
-    total_api_pages = float('inf')
+    start_date_iso = get_collector_state(hf_token)
+    
+    current_page = 1
+    requests_processed = 0
+    movies_collected_in_run = 0
+    latest_timestamp_this_run = start_date_iso
 
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
 
-    temp_archive_path = None
-    gzip_file = None
-
+    date_str = datetime.utcnow().strftime('%Y-%m-%d_%H-%M')
+    archive_filename = f"part_{date_str}_updates_since_{start_date_iso.replace(':', '-')}.jsonl.gz"
+    temp_archive_path = output_dir / archive_filename
+    
     try:
-        while pages_processed < MAX_REQUESTS_PER_RUN:
-            if 'total_api_pages' in locals() and current_page > total_api_pages and total_api_pages != float('inf'):
-                logging.info(f"Reached the end of available pages ({total_api_pages}). Looping back to page 1 for updates.")
-                current_page = 1
+        with gzip.open(temp_archive_path, 'wt', encoding='utf-8') as gzip_file:
+            while requests_processed < MAX_REQUESTS_PER_RUN:
+                data = fetch_page_with_retries(current_page, kinopoisk_api_key, start_date_iso)
+                requests_processed += 1
 
-            data = fetch_page_with_retries(current_page, kinopoisk_api_key)
-            if data is None:
-                # Логируем, что страница была пропущена, и продолжаем
-                logging.warning(f"Skipping page {current_page} due to fetch/decode errors after all retries.")
-                last_successful_page = current_page # Считаем страницу обработанной, чтобы не застрять
-                pages_processed += 1
-                current_page += 1
-                continue
+                if not data or not data.get('docs'):
+                    logging.info(f"No more movies found. Stopping collection for this run.")
+                    break
 
-            if pages_processed == 0:
-                total_api_pages = data.get('pages', total_api_pages)
-                logging.info(f"Total pages available in API: {total_api_pages}")
-
-                end_page_in_run = start_page + MAX_REQUESTS_PER_RUN - 1
-                date_str = datetime.utcnow().strftime('%Y-%m-%d_%H-%M')
-                archive_filename = f"part_{date_str}_{start_page:05d}-{end_page_in_run:05d}.jsonl.gz"
-                temp_archive_path = output_dir / archive_filename
-                gzip_file = gzip.open(temp_archive_path, 'wt', encoding='utf-8')
-
-            if 'docs' in data and data['docs']:
-                movie_count = len(data['docs'])
+                docs = data['docs']
+                movie_count = len(docs)
+                movies_collected_in_run += movie_count
                 logging.info(f"Page {current_page}: Found {movie_count} movies. Writing to archive.")
-                for movie in data['docs']:
+                
+                for movie in docs:
                     gzip_file.write(json.dumps(movie, ensure_ascii=False) + '\n')
-            else:
-                logging.warning(f"Page {current_page}: 'docs' key not found or is empty in the response.")
+                
+                last_movie_in_batch_date = docs[-1].get("updatedAt")
+                if last_movie_in_batch_date:
+                    latest_timestamp_this_run = last_movie_in_batch_date
 
-            last_successful_page = current_page
-            pages_processed += 1
-            current_page += 1
-
+                if movie_count < 250:
+                    logging.info("Received a partial page, which means it's the last page of results. Stopping.")
+                    break
+                
+                current_page += 1
+                
     except Exception as e:
-        logging.critical(f"A critical, unrecoverable error occurred during processing: {e}", exc_info=True)
+        logging.critical(f"A critical, unrecoverable error occurred: {e}", exc_info=True)
+        if temp_archive_path.exists():
+            os.remove(temp_archive_path)
         sys.exit(1)
-    finally:
-        if gzip_file:
-            gzip_file.close()
 
-    if pages_processed == 0 or temp_archive_path is None or not temp_archive_path.exists() or temp_archive_path.stat().st_size == 0:
-        logging.info("No new data was collected in this run. Exiting successfully.")
+    if movies_collected_in_run == 0:
+        logging.info("No new data was collected in this run. Deleting empty archive and exiting.")
+        if temp_archive_path.exists():
+            os.remove(temp_archive_path)
         sys.exit(0)
 
-    logging.info(f"\nProcessing finished. Total pages processed in this run: {pages_processed}.")
-    logging.info(f"Last successfully processed page: {last_successful_page}.")
+    logging.info(f"\nProcessing finished. Requests made: {requests_processed}. Movies collected: {movies_collected_in_run}.")
+    logging.info(f"New state timestamp will be: {latest_timestamp_this_run}")
 
-    logging.info(f"Uploading {temp_archive_path.name} to dataset...")
+    logging.info(f"Uploading data chunk {temp_archive_path.name} to dataset...")
     api.upload_file(
         path_or_fileobj=str(temp_archive_path),
         path_in_repo=f"{RAW_DATA_DIR}/{temp_archive_path.name}",
         repo_id=DATASET_ID, repo_type="dataset", token=hf_token
     )
 
-    new_metadata = {"last_successful_page": last_successful_page}
+    new_metadata = {"last_processed_update_iso": latest_timestamp_this_run}
     local_metadata_path = output_dir / METADATA_FILENAME
     with open(local_metadata_path, 'w', encoding='utf-8') as f:
         json.dump(new_metadata, f)
 
-    logging.info(f"Uploading {METADATA_FILENAME} to dataset...")
+    logging.info(f"Uploading new state file {METADATA_FILENAME}...")
     api.upload_file(
         path_or_fileobj=str(local_metadata_path),
         path_in_repo=METADATA_FILENAME,
         repo_id=DATASET_ID, repo_type="dataset", token=hf_token,
-        commit_message=f"Update metadata to page {last_successful_page}"
+        commit_message=f"Collector state update: {latest_timestamp_this_run}"
     )
 
     if os.getenv("GITHUB_ACTIONS"):
         with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
             f.write(f"ARTIFACT_CHUNK_PATH={temp_archive_path}\n")
 
-    logging.info("\nDaily collection run completed successfully.")
+    logging.info("\nCollection run completed successfully.")
 
 if __name__ == "__main__":
     main()
