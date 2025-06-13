@@ -27,10 +27,17 @@ jobs:
           KINOPOISK_API_KEY: ${{ secrets.KINOPOISK_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
-      - name: Upload results as a temporary artifact
-        if: env.ARTIFACT_PATH
+      - name: Upload data chunk artifact
+        if: success() && env.ARTIFACT_CHUNK_PATH
         uses: actions/upload-artifact@v4
         with:
           name: kinopoisk-raw-data-chunk
-          path: ${{ env.ARTIFACT_PATH }}
+          path: ${{ env.ARTIFACT_CHUNK_PATH }}
+
+      - name: Upload log artifact
+        if: always() && env.LOG_FILE_PATH
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-collector-logs
+          path: ${{ env.LOG_FILE_PATH }}
 
