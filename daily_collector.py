@@ -51,6 +51,18 @@ def main():
     kinopoisk_api_key = get_required_env_var("KINOPOISK_API_KEY")
     hf_token = get_required_env_var("HF_TOKEN")
     
+    api = HfApi()
+    
+    # --- ИЗМЕНЕНИЕ: Автоматическое создание датасета ---
+    print(f"Ensuring dataset '{DATASET_ID}' exists...")
+    api.create_repo(
+        repo_id=DATASET_ID,
+        repo_type="dataset",
+        token=hf_token,
+        exist_ok=True # Не вызовет ошибку, если датасет уже существует
+    )
+    print("Dataset exists or was created successfully.")
+    
     start_page = get_start_page(hf_token)
     current_page = start_page
     last_successful_page = start_page - 1
@@ -66,10 +78,22 @@ def main():
     try:
         while pages_processed < MAX_REQUESTS_PER_RUN and current_page <= total_api_pages:
             print(f"Processing page {current_page}...")
-            url = f"{API_BASE_URL}?page={current_page}&limit=250"
+            
+            # --- ИЗМЕНЕНИЕ: Точный URL-запрос со всеми параметрами ---
+            params = [
+                ('page', current_page),
+                ('limit', 250),
+                ('sortField', 'votes.kp'),
+                ('sortField', 'votes.imdb'),
+                ('sortField', 'rating.imdb'),
+                ('sortType', -1),
+                ('sortType', -1),
+                ('sortType', -1),
+                ('selectFields', '')
+            ]
             headers = {"X-API-KEY": kinopoisk_api_key}
             
-            response = requests.get(url, headers=headers, timeout=90)
+            response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=90)
             response.raise_for_status()
             data = response.json()
 
@@ -105,9 +129,7 @@ def main():
 
     print(f"\nProcessing finished. Total pages processed in this run: {pages_processed}.")
     print(f"Last successfully processed page: {last_successful_page}.")
-    
-    api = HfApi()
-    
+        
     print(f"Uploading {temp_archive_path.name} to dataset...")
     api.upload_file(
         path_or_fileobj=str(temp_archive_path),
