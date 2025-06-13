@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # ИЗМЕНЕНО: Запуск каждый день в 9:20 по UTC (12:20 по МСК)
-    - cron: '40 9 * * *'
+    - cron: '20 9 * * *'
 
 jobs:
   parse-and-upload:
