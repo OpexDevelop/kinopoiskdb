@@ -1,12 +1,24 @@
-name: 2. Consolidate Dataset (Manual Run)
+name: 2. Consolidate Dataset
 
 on:
+  # Оставляем возможность ручного запуска
   workflow_dispatch:
 
+  # ДОБАВЛЕНО: Автоматический запуск после успешного завершения сборщика
+  workflow_run:
+    # Название воркфлоу, за которым мы следим.
+    # Должно в точности совпадать с полем 'name' в daily_collector.yml
+    workflows: ["1. Kinopoisk Daily Collector"]
+    # Тип события - завершение
+    types:
+      - completed
+
 jobs:
+  # Запускаем консолидацию, только если сборщик завершился УСПЕШНО
   consolidate:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout repository code
@@ -31,3 +43,5 @@ jobs:
         with:
           name: consolidator-logs
           path: ${{ env.LOG_FILE_PATH }}
+
+
