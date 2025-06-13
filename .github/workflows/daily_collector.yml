@@ -1,45 +1,33 @@
-# Имя воркфлоу, на которое ссылается consolidate.yml
 name: 1. Kinopoisk Data Collector
 
 on:
-  # Позволяет запускать вручную из интерфейса GitHub Actions
   workflow_dispatch:
-  
-  # Запуск по расписанию
   schedule:
-    # Запускается каждые 4 часа (в 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
-    # Это дает 6 запусков в сутки.
     - cron: '0 */4 * * *'
 
 jobs:
   parse-and-upload:
     runs-on: ubuntu-latest
     steps:
-      # 1. Скачиваем код из репозитория
       - name: Checkout repository code
         uses: actions/checkout@v4
 
-      # 2. Настраиваем Python
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # Кешируем зависимости для ускорения будущих запусков
+          # УБРАНА СТРОКА 'cache: pip', КОТОРАЯ ВЫЗЫВАЛА ОШИБКУ
 
-      # 3. Устанавливаем зависимости
       - name: Install dependencies
         run: pip install requests huggingface_hub
 
-      # 4. Запускаем основной скрипт сборщика
       - name: Run collector script
         id: parser
         run: python daily_collector.py
         env:
-          # Секреты передаются из настроек репозитория GitHub
           KINOPOISK_API_KEY: ${{ secrets.KINOPOISK_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
-      # 5. Загружаем собранные данные как артефакт (для отладки)
       - name: Upload data chunk artifact
         if: success() && env.ARTIFACT_CHUNK_PATH
         uses: actions/upload-artifact@v4
@@ -47,7 +35,6 @@ jobs:
           name: kinopoisk-raw-data-chunk
           path: ${{ env.ARTIFACT_CHUNK_PATH }}
 
-      # 6. Загружаем лог-файл как артефакт (важно для отладки)
       - name: Upload log artifact
         if: always() && env.LOG_FILE_PATH
         uses: actions/upload-artifact@v4
