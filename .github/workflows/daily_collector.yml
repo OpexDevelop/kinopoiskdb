@@ -3,7 +3,8 @@ name: 1. Kinopoisk Daily Collector
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'
+    # ИЗМЕНЕНО: Запуск каждый день в 9:00 по UTC (12:00 по МСК)
+    - cron: 0 9 * * *'
 
 jobs:
   parse-and-upload:
