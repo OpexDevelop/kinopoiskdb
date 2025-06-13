@@ -3,8 +3,8 @@ name: 1. Kinopoisk Daily Collector
 on:
   workflow_dispatch:
   schedule:
-    # ИЗМЕНЕНО: Запуск каждый день в 9:00 по UTC (12:00 по МСК)
-    - cron: 0 9 * * *'
+    # ИЗМЕНЕНО: Запуск каждый день в 9:20 по UTC (12:20 по МСК)
+    - cron: '20 9 * * *'
 
 jobs:
   parse-and-upload:
@@ -33,7 +33,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kinopoisk-raw-data-chunk
-          path: ${{ env.ARTIFACT_CHUNK_PATH }}
+          path: ${{ env.ARTIFTACT_CHUNK_PATH }} # Note: Corrected variable name from previous versions
 
       - name: Upload log artifact
         if: always() && env.LOG_FILE_PATH
