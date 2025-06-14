@@ -7,8 +7,9 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-# ИСПРАВЛЕНО: Добавлен недостающий импорт HfHubHTTPError
-from huggingface_hub import HfApi, hf_hub_download, list_repo_files, delete_file, HfHubHTTPError
+# ИСПРАВЛЕНО: Правильный импорт модуля с классами ошибок
+from huggingface_hub import HfApi, hf_hub_download, list_repo_files, delete_file
+from huggingface_hub.errors import EntryNotFoundError
 
 # --- Конфигурация ---
 HF_USERNAME = "opex792"
@@ -80,7 +81,6 @@ def main():
     db_conn = setup_database(DB_FILENAME)
     db_cursor = db_conn.cursor()
     
-    # 1. Скачиваем и обрабатываем основной консолидированный файл (если есть)
     consolidated_repo_path = f"{CONSOLIDATED_DIR}/{CONSOLIDATED_FILENAME}"
     try:
         logging.info(f"Attempting to download main consolidated file: {consolidated_repo_path}...")
@@ -89,15 +89,13 @@ def main():
         )
         process_file_into_db(local_consolidated_path, db_cursor, file_type="Main")
         db_conn.commit()
-    except HfHubHTTPError as e:
-        # Теперь этот блок будет работать правильно
-        if e.response.status_code == 404:
-            logging.warning("Main consolidated file not found. A new one will be created.")
-        else: 
-            logging.error(f"An unexpected HTTP error occurred when downloading the main file: {e}")
-            raise
+    # ИСПРАВЛЕНО: Используем правильный класс ошибки
+    except EntryNotFoundError:
+        logging.warning("Main consolidated file not found (404). A new one will be created. This is normal for the first run.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred when downloading the main file: {e}", exc_info=True)
+        raise
 
-    # 2. Скачиваем и обрабатываем все "сырые" файлы-куски
     try:
         raw_files_in_repo = [f for f in api.list_repo_files(repo_id=DATASET_ID, repo_type="dataset") if f.startswith(f"{RAW_DATA_DIR}/")]
     except Exception as e:
@@ -113,7 +111,6 @@ def main():
             process_file_into_db(local_raw_path, db_cursor, file_type="Raw")
             db_conn.commit()
 
-    # 3. Сохраняем объединенную базу в новый файл
     output_dir = Path("output_consolidated")
     output_dir.mkdir(exist_ok=True)
     final_archive_path = output_dir / CONSOLIDATED_FILENAME
@@ -136,7 +133,6 @@ def main():
             for row in rows: f.write(row[0] + '\n')
     db_conn.close()
 
-    # 4. Загружаем новый консолидированный файл
     logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
     api.upload_file(
         path_or_fileobj=str(final_archive_path),
@@ -144,7 +140,6 @@ def main():
         repo_id=DATASET_ID, repo_type="dataset"
     )
 
-    # 5. Удаляем обработанные "сырые" файлы
     if raw_files_in_repo:
         logging.info("Deleting processed raw files from repository...")
         for file_path in raw_files_in_repo:
@@ -154,11 +149,9 @@ def main():
             except Exception as e:
                 logging.error(f"Could not delete file {file_path}. Please delete it manually. Error: {e}")
 
-    # 6. Очистка
     os.remove(DB_FILENAME)
     logging.info("\nConsolidation run completed successfully.")
 
 if __name__ == "__main__":
     main()
-
 
