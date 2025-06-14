@@ -1,0 +1,36 @@
+# Имя воркфлоу, которое будет отображаться в GitHub
+name: Manual Consolidation
+
+on:
+  # Этот триггер позволяет запускать воркфлоу вручную из интерфейса GitHub
+  workflow_dispatch:
+
+jobs:
+  # Единственная задача в этом воркфлоу
+  run-manual-consolidation:
+    name: "Run Manual Consolidator"
+    # Запускаем на стандартной виртуальной машине GitHub
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Клонируем код репозитория, чтобы получить доступ к скрипту
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python нужной версии
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Устанавливаем зависимости, необходимые для работы скрипта
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      # 4. Запускаем наш скрипт для ручной консолидации
+      - name: Run manual consolidator script
+        env:
+          # Передаем токен для доступа к Hugging Face из секретов репозитория
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python manual_consolidator.py
+
