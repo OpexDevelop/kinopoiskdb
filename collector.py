@@ -7,6 +7,7 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ИСПРАВЛЕНО: Правильный импорт модуля с классами ошибок
 from huggingface_hub import HfApi, hf_hub_download
@@ -21,6 +22,7 @@ API_BASE_URL = "https://api.kinopoisk.dev/v1.4/movie"
 REQUEST_TIMEOUT_SECONDS = 240
 MAX_RETRIES = 5
 DEFAULT_START_DATE_ISO = "1970-01-01T00:00:00.000Z"
+MAX_CONCURRENT_REQUESTS = 15
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -33,6 +35,7 @@ class RateLimitException(Exception):
     pass
 
 def get_env_var(var_name, default=None):
+    """Получает переменную окружения или завершает работу, если она не установлена."""
     value = os.getenv(var_name, default)
     if value is None:
         logging.critical(f"Error: Environment variable {var_name} is not set.")
@@ -53,7 +56,6 @@ def get_collector_state(api: HfApi):
         last_date = state.get("last_processed_update_iso", DEFAULT_START_DATE_ISO)
         logging.info(f"Found state. Last processed date: {last_date}")
         return last_date
-    # ИСПРАВЛЕНО: Используем правильный класс ошибки для 404
     except EntryNotFoundError:
         logging.warning("State file not found. This is the first run. Starting from the beginning.")
         return DEFAULT_START_DATE_ISO
@@ -76,7 +78,7 @@ def update_collector_state(api: HfApi, new_date_iso: str):
     )
 
 def fetch_page(page, api_key, start_date_iso):
-    """Запрашивает одну страницу из API."""
+    """Запрашивает одну страницу из API. Возвращает кортеж (page, data)."""
     try:
         start_dt_object = datetime.fromisoformat(start_date_iso.replace('Z', '+00:00'))
         start_date_dmy = start_dt_object.strftime('%d.%m.%Y')
@@ -90,16 +92,23 @@ def fetch_page(page, api_key, start_date_iso):
     headers = {"X-API-KEY": api_key}
     
     logging.info(f"Requesting page {page} with updatedAt > {start_date_dmy}...")
-    response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-
-    if response.status_code == 403:
-        raise RateLimitException("Rate limit exceeded (403 Forbidden).")
     
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            if response.status_code == 403:
+                raise RateLimitException(f"Rate limit exceeded on page {page} (403 Forbidden).")
+            response.raise_for_status()
+            return page, response.json()
+        except (requests.exceptions.RequestException, RateLimitException) as e:
+            logging.warning(f"Attempt {attempt + 1}/{MAX_RETRIES} for page {page} failed: {e}")
+            if isinstance(e, RateLimitException) or attempt + 1 == MAX_RETRIES:
+                raise
+            time.sleep(2 ** attempt) # Экспоненциальная задержка
+    return page, None # В случае, если все попытки не удались
 
 def main():
-    """Основная функция сбора данных."""
+    """Основная функция сбора данных с параллельными запросами."""
     hf_token = get_env_var("HF_TOKEN")
     api_keys_str = get_env_var("KINOPOISK_API_KEYS")
     max_requests = int(get_env_var("MAX_REQUESTS_PER_RUN", "200"))
@@ -112,10 +121,8 @@ def main():
     num_tokens = len(api_keys)
     current_hour = datetime.utcnow().hour
     
-    # --- Логика умного распределения ---
-    # Определяем интервал между запусками, чтобы равномерно использовать ключи в течение суток
-    interval = 24 // num_tokens
-    if interval == 0: interval = 1 # На случай если ключей > 24
+    interval = 24 // num_tokens if num_tokens > 0 else 24
+    if interval == 0: interval = 1
 
     if current_hour % interval != 0:
         logging.info(f"Current hour {current_hour} is not a scheduled slot for {num_tokens} tokens with interval {interval}. Skipping run.")
@@ -126,43 +133,54 @@ def main():
     logging.info(f"This is a scheduled run. Using API key #{key_index}.")
     
     api = HfApi(token=hf_token)
-    
     start_date_iso = get_collector_state(api)
     
-    current_page = 1
-    requests_processed = 0
     collected_movies = []
     
-    while requests_processed < max_requests:
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+        futures = {executor.submit(fetch_page, page, api_key, start_date_iso): page for page in range(1, max_requests + 1)}
+        
         try:
-            data = fetch_page(current_page, api_key, start_date_iso)
-            requests_processed += 1
+            for future in as_completed(futures):
+                page_num = futures[future]
+                try:
+                    _page, data = future.result()
+                    if not data or not data.get('docs'):
+                        logging.info(f"Page {page_num}: No more movies found. Stopping collection.")
+                        # Отменяем оставшиеся задачи
+                        for f in futures: f.cancel()
+                        break
+                    
+                    docs = data['docs']
+                    collected_movies.extend(docs)
+                    logging.info(f"Page {page_num}: Found {len(docs)} movies.")
 
-            if not data or not data.get('docs'):
-                logging.info("No more movies found for the given period. Stopping collection.")
-                break
-            
-            docs = data['docs']
-            collected_movies.extend(docs)
-            logging.info(f"Page {current_page}: Found {len(docs)} movies.")
+                    if len(docs) < 250:
+                        logging.info("Received a partial page, meaning it's the last page. Stopping.")
+                        # Отменяем оставшиеся задачи
+                        for f in futures: f.cancel()
+                        break
 
-            if len(docs) < 250:
-                logging.info("Received a partial page, meaning it's the last page. Stopping.")
-                break
-            
-            current_page += 1
-            time.sleep(1)
+                except RateLimitException as e:
+                    logging.warning(f"Stopping run due to API rate limit: {e}")
+                    # Отменяем оставшиеся задачи
+                    for f in futures: f.cancel()
+                    break
+                except Exception as exc:
+                    logging.error(f'Page {page_num} generated an exception: {exc}', exc_info=True)
 
-        except RateLimitException as e:
-            logging.warning(f"Stopping run due to API rate limit: {e}")
-            break
-        except Exception as e:
-            logging.error(f"A critical error occurred during fetch: {e}", exc_info=True)
-            sys.exit(1)
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user. Shutting down...")
+            for f in futures: f.cancel()
+
 
     if not collected_movies:
         logging.info("No new movies were collected in this run. Exiting without changing state.")
         sys.exit(0)
+
+    # Сортируем все собранные фильмы по `updatedAt` чтобы найти самый последний
+    logging.info("Sorting all collected movies by update date...")
+    collected_movies.sort(key=lambda m: m.get('updatedAt', ''))
 
     logging.info(f"\nCollection finished. Total movies collected: {len(collected_movies)}.")
     
@@ -200,5 +218,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
+                        
