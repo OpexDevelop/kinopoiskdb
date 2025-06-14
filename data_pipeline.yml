@@ -1,0 +1,76 @@
+# Имя воркфлоу
+name: Data Pipeline
+
+on:
+  # Запуск по расписанию
+  schedule:
+    # Запускает воркфлоу в начале каждого часа
+    - cron: '0 * * * *'
+  # Позволяет запускать вручную из интерфейса GitHub Actions
+  workflow_dispatch:
+
+# Гарантирует, что коллектор и консолидатор никогда не будут запущены одновременно.
+# Если один работает, другой ждет в очереди.
+concurrency:
+  group: kinopoisk-data-sync
+  cancel-in-progress: false
+
+jobs:
+  # ЗАДАЧА №1: СБОРЩИК (ЛЕГКИЙ, ЧАСТЫЙ)
+  collector:
+    name: "Run Collector"
+    # Эта задача запускается каждый раз, когда воркфлоу триггерится (т.е. каждый час)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      - name: Run collector script
+        env:
+          # ВАЖНО: В настройках репозитория создайте секрет 'KINOPOISK_API_KEYS'
+          # и запишите туда все ваши ключи через запятую, без пробелов.
+          # Пример: "key1,key2,key3,key4"
+          KINOPOISK_API_KEYS: ${{ secrets.KINOPOISK_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Можете изменить это значение на '2' или '5' для тестов
+          MAX_REQUESTS_PER_RUN: '200'
+        run: python collector.py
+
+  # ЗАДАЧА №2: КОНСОЛИДАТОР (ТЯЖЕЛЫЙ, РЕДКИЙ)
+  consolidator:
+    name: "Run Consolidator"
+    # УСЛОВИЕ ЗАПУСКА:
+    # Запускается только если триггер - это расписание на 3 часа ночи по UTC,
+    # ИЛИ если воркфлоу был запущен вручную (для тестов).
+    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
+    
+    # ЗАВИСИМОСТЬ:
+    # Эта задача начнется только после того, как задача 'collector' за этот же час успешно завершится.
+    needs: collector
+    
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      - name: Run consolidator script
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python consolidator.py
+
