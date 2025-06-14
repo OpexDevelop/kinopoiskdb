@@ -41,7 +41,7 @@ jobs:
           KINOPOISK_API_KEYS: ${{ secrets.KINOPOISK_API_KEYS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # Можете изменить это значение на '2' или '5' для тестов
-          MAX_REQUESTS_PER_RUN: '5'
+          MAX_REQUESTS_PER_RUN: '200'
         run: python collector.py
 
   # ЗАДАЧА №2: КОНСОЛИДАТОР (ТЯЖЕЛЫЙ, РЕДКИЙ)
