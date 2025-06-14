@@ -1,0 +1,45 @@
+# Имя воркфлоу, которое будет отображаться в GitHub
+name: Analyze Dataset Updates
+
+on:
+  # Этот триггер позволяет запускать воркфлоу вручную из интерфейса GitHub
+  workflow_dispatch:
+
+jobs:
+  # Единственная задача в этом воркфлоу
+  analyze:
+    name: "Download and Analyze Dataset"
+    # Запускаем на стандартной виртуальной машине GitHub
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Клонируем код репозитория, чтобы получить доступ к скрипту analyzer.py
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python нужной версии
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Устанавливаем зависимости, необходимые для работы скрипта
+      - name: Install dependencies
+        run: pip install huggingface_hub requests
+
+      # 4. Запускаем наш скрипт анализа
+      - name: Run analyzer script
+        env:
+          # Передаем токен для доступа к Hugging Face из секретов репозитория
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python analyzer.py
+
+      # 5. Загружаем созданный файл update_stats.txt в артефакты
+      - name: Upload statistics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Имя артефакта, которое будет видно в интерфейсе
+          name: daily-update-statistics
+          # Путь к файлу, который нужно загрузить
+          path: update_stats.txt
+
