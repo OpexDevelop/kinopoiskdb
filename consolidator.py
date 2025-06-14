@@ -7,8 +7,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-# ИСПРАВЛЕНО: Правильный импорт модуля с классами ошибок
-from huggingface_hub import HfApi, hf_hub_download, list_repo_files, delete_file
+from huggingface_hub import HfApi, hf_hub_download, delete_file
 from huggingface_hub.errors import EntryNotFoundError
 
 # --- Конфигурация ---
@@ -84,12 +83,11 @@ def main():
     consolidated_repo_path = f"{CONSOLIDATED_DIR}/{CONSOLIDATED_FILENAME}"
     try:
         logging.info(f"Attempting to download main consolidated file: {consolidated_repo_path}...")
-        local_consolidated_path = api.hf_hub_download(
+        local_consolidated_path = hf_hub_download(
             repo_id=DATASET_ID, filename=consolidated_repo_path, repo_type="dataset"
         )
         process_file_into_db(local_consolidated_path, db_cursor, file_type="Main")
         db_conn.commit()
-    # ИСПРАВЛЕНО: Используем правильный класс ошибки
     except EntryNotFoundError:
         logging.warning("Main consolidated file not found (404). A new one will be created. This is normal for the first run.")
     except Exception as e:
@@ -107,7 +105,7 @@ def main():
     else:
         logging.info(f"Found {len(raw_files_in_repo)} raw files to consolidate.")
         for file_path in raw_files_in_repo:
-            local_raw_path = api.hf_hub_download(repo_id=DATASET_ID, filename=file_path, repo_type="dataset")
+            local_raw_path = hf_hub_download(repo_id=DATASET_ID, filename=file_path, repo_type="dataset")
             process_file_into_db(local_raw_path, db_cursor, file_type="Raw")
             db_conn.commit()
 
@@ -154,4 +152,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
