@@ -8,10 +8,11 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-from huggingface_hub import HfApi
-from huggingface_hub.utils import HfHubHTTPError
+# ИСПРАВЛЕНО: Правильный импорт модуля с классами ошибок
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 
-# --- Configuration ---
+# --- Конфигурация ---
 HF_USERNAME = "opex792"
 DATASET_ID = f"{HF_USERNAME}/kinopoisk"
 RAW_DATA_DIR = "raw_data"
@@ -21,7 +22,7 @@ REQUEST_TIMEOUT_SECONDS = 240
 MAX_RETRIES = 5
 DEFAULT_START_DATE_ISO = "1970-01-01T00:00:00.000Z"
 
-# --- Logging Setup ---
+# --- Настройка логирования ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -39,7 +40,7 @@ def get_env_var(var_name, default=None):
     return value
 
 def get_collector_state(api: HfApi):
-    """Fetches the collector's state (last processed date) from the repo."""
+    """Получает состояние сборщика (последняя дата) из репозитория."""
     try:
         logging.info(f"Attempting to download state file: {STATE_FILENAME}")
         state_path = api.hf_hub_download(
@@ -52,15 +53,16 @@ def get_collector_state(api: HfApi):
         last_date = state.get("last_processed_update_iso", DEFAULT_START_DATE_ISO)
         logging.info(f"Found state. Last processed date: {last_date}")
         return last_date
-    except HfHubHTTPError as e:
-        if e.response.status_code == 404:
-            logging.warning("State file not found. This is the first run. Starting from the beginning.")
-            return DEFAULT_START_DATE_ISO
-        else:
-            raise
+    # ИСПРАВЛЕНО: Используем правильный класс ошибки для 404
+    except EntryNotFoundError:
+        logging.warning("State file not found. This is the first run. Starting from the beginning.")
+        return DEFAULT_START_DATE_ISO
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred while fetching state: {e}")
+        sys.exit(1)
 
 def update_collector_state(api: HfApi, new_date_iso: str):
-    """Uploads the new state file to the repository."""
+    """Загружает новый файл состояния в репозиторий."""
     state = {"last_processed_update_iso": new_date_iso}
     local_state_path = Path(STATE_FILENAME)
     with open(local_state_path, 'w', encoding='utf-8') as f:
@@ -74,7 +76,7 @@ def update_collector_state(api: HfApi, new_date_iso: str):
     )
 
 def fetch_page(page, api_key, start_date_iso):
-    """Fetches a single page from the API."""
+    """Запрашивает одну страницу из API."""
     try:
         start_dt_object = datetime.fromisoformat(start_date_iso.replace('Z', '+00:00'))
         start_date_dmy = start_dt_object.strftime('%d.%m.%Y')
@@ -97,7 +99,7 @@ def fetch_page(page, api_key, start_date_iso):
     return response.json()
 
 def main():
-    """Main data collection function."""
+    """Основная функция сбора данных."""
     hf_token = get_env_var("HF_TOKEN")
     api_keys_str = get_env_var("KINOPOISK_API_KEYS")
     max_requests = int(get_env_var("MAX_REQUESTS_PER_RUN", "200"))
@@ -109,13 +111,17 @@ def main():
 
     num_tokens = len(api_keys)
     current_hour = datetime.utcnow().hour
+    
+    # --- Логика умного распределения ---
+    # Определяем интервал между запусками, чтобы равномерно использовать ключи в течение суток
+    interval = 24 // num_tokens
+    if interval == 0: interval = 1 # На случай если ключей > 24
 
-    # --- Smart distribution logic ---
-    if current_hour % (24 // num_tokens) != 0:
-        logging.info(f"Current hour {current_hour} is not a scheduled slot for {num_tokens} tokens. Skipping run.")
+    if current_hour % interval != 0:
+        logging.info(f"Current hour {current_hour} is not a scheduled slot for {num_tokens} tokens with interval {interval}. Skipping run.")
         sys.exit(0)
     
-    key_index = (current_hour // (24 // num_tokens)) % num_tokens
+    key_index = (current_hour // interval) % num_tokens
     api_key = api_keys[key_index]
     logging.info(f"This is a scheduled run. Using API key #{key_index}.")
     
@@ -182,7 +188,7 @@ def main():
         )
         logging.info("Raw chunk upload successful.")
 
-        # --- Update state only after successful upload ---
+        # --- Обновляем состояние только после успешной загрузки файла ---
         latest_update_iso = collected_movies[-1].get("updatedAt", start_date_iso)
         update_collector_state(api, latest_update_iso)
 
