@@ -34,12 +34,11 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python analyzer.py
 
-      # 5. Загружаем созданный файл update_stats.txt в артефакты
+      # 5. Загружаем созданный файл analysis_report.txt в артефакты
       - name: Upload statistics artifact
         uses: actions/upload-artifact@v4
         with:
           # Имя артефакта, которое будет видно в интерфейсе
           name: daily-update-statistics
-          # Путь к файлу, который нужно загрузить
-          path: update_stats.txt
-
+          # ИСПРАВЛЕНО: Путь к файлу, который нужно загрузить
+          path: analysis_report.txt
