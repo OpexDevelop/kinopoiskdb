@@ -451,4 +451,13 @@ def main():
                  break
 
     except (RateLimitException, KeyboardInterrupt) as e:
-        logging.warning(f"Работа прервана: {e}. Сохранение теку
+        logging.warning(f"Работа прервана: {e}. Сохранение текущего состояния.")
+    except Exception as e:
+        logging.critical(f"Непредвиденная критическая ошибка: {e}", exc_info=True)
+    finally:
+        save_data_chunk(api, all_collected_movies)
+        update_state(api, state)
+        logging.info(f"\nЗапуск завершен. Всего использовано запросов: {requests_processed}.")
+
+if __name__ == "__main__":
+    main()
