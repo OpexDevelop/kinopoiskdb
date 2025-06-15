@@ -8,8 +8,8 @@ on:
   # Позволяет запускать вручную из интерфейса GitHub Actions
   workflow_dispatch:
 
-# Гарантирует, что коллектор и консолидатор никогда не будут запущены одновременно.
-# Если один работает, другой ждет в очереди.
+# Гарантирует, что только один экземпляр этого воркфлоу (collector или consolidator)
+# может работать в любой момент времени.
 concurrency:
   group: kinopoisk-data-sync
   cancel-in-progress: false
@@ -44,7 +44,7 @@ jobs:
   # ЗАДАЧА №2: КОНСОЛИДАТОР (ТЯЖЕЛЫЙ, РЕДКИЙ)
   consolidator:
     name: "Run Consolidator"
-    # Эта задача начнется только после того, как задача 'collector' за этот же час успешно завершится.
+    # Эта задача начнется только после того, как задача 'collector' успешно завершится.
     needs: collector
     runs-on: ubuntu-latest
     steps:
@@ -80,4 +80,5 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python consolidator.py
+
 
