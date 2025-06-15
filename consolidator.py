@@ -18,6 +18,7 @@ RAW_DATA_DIR = "raw_data"
 CONSOLIDATED_DIR = "consolidated"
 CONSOLIDATED_FILENAME = "kinopoisk.jsonl.gz"
 DB_FILENAME = "consolidation_db.sqlite"
+BATCH_SIZE = 5000
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -56,15 +57,25 @@ def setup_database(db_path):
         updated_at_ts INTEGER NOT NULL,
         data TEXT NOT NULL
     );
-    CREATE INDEX idx_id_updated ON movies(id, updated_at_ts);
+    CREATE INDEX idx_updated_at ON movies(updated_at_ts);
     ''')
     db_conn.commit()
     return db_conn
 
 def process_file_into_db(file_path, db_conn, file_type="File"):
-    """Читает файл .jsonl.gz и вставляет/обновляет данные в БД."""
+    """Читает файл .jsonl.gz и вставляет/обновляет данные в БД, избегая перезаписи более свежих данных старыми."""
     logging.info(f"Processing {file_type} into database: {Path(file_path).name}...")
     cursor = db_conn.cursor()
+
+    sql_upsert = """
+    INSERT INTO movies (id, updated_at_ts, data)
+    VALUES (?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+        updated_at_ts = excluded.updated_at_ts,
+        data = excluded.data
+    WHERE excluded.updated_at_ts > movies.updated_at_ts;
+    """
+
     batch = []
     with gzip.open(file_path, 'rt', encoding='utf-8') as f:
         for line in f:
@@ -72,18 +83,23 @@ def process_file_into_db(file_path, db_conn, file_type="File"):
                 movie = json.loads(line)
                 movie_id = movie.get("id")
                 if not movie_id: continue
+                
                 updated_at_str = movie.get("updatedAt")
                 updated_at_ts = parse_iso_date_to_timestamp(updated_at_str)
                 movie_data_json = json.dumps(movie, ensure_ascii=False)
+                
                 batch.append((movie_id, updated_at_ts, movie_data_json))
-                if len(batch) >= 5000:
-                    cursor.executemany("INSERT OR REPLACE INTO movies (id, updated_at_ts, data) VALUES (?, ?, ?)", batch)
+
+                if len(batch) >= BATCH_SIZE:
+                    cursor.executemany(sql_upsert, batch)
                     db_conn.commit()
                     batch = []
+
             except json.JSONDecodeError:
                 logging.warning(f"JSON decode error in {Path(file_path).name}. Skipping line.")
+
     if batch:
-        cursor.executemany("INSERT OR REPLACE INTO movies (id, updated_at_ts, data) VALUES (?, ?, ?)", batch)
+        cursor.executemany(sql_upsert, batch)
         db_conn.commit()
 
 def main():
@@ -91,7 +107,6 @@ def main():
     api = HfApi(token=hf_token)
     db_conn = setup_database(DB_FILENAME)
     
-    # 1. Загрузка и обработка основного консолидированного файла
     consolidated_repo_path = f"{CONSOLIDATED_DIR}/{CONSOLIDATED_FILENAME}"
     try:
         logging.info(f"Attempting to download main consolidated file: {consolidated_repo_path}...")
@@ -101,16 +116,17 @@ def main():
         process_file_into_db(local_consolidated_path, db_conn, file_type="Main")
     except HfHubHTTPError as e:
         if e.response.status_code == 404:
-            logging.warning("Main consolidated file not found (404). A new one will be created.")
+            logging.warning("Main consolidated file not found. A new one will be created.")
         else:
             logging.error(f"HTTP error downloading main file: {e}", exc_info=True)
-            raise
+            db_conn.close()
+            sys.exit(1)
     
-    # 2. Загрузка и обработка новых "сырых" чанков
     try:
         raw_files_in_repo = [f for f in api.list_repo_files(repo_id=DATASET_ID, repo_type="dataset") if f.startswith(f"{RAW_DATA_DIR}/")]
     except Exception as e:
         logging.critical(f"Could not list repo files. Error: {e}", exc_info=True)
+        db_conn.close()
         sys.exit(1)
     
     if raw_files_in_repo:
@@ -122,35 +138,40 @@ def main():
             except Exception as e:
                 logging.error(f"Failed to process raw file {file_path}: {e}", exc_info=True)
     
-    # 3. Запись нового консолидированного файла
     output_dir = Path("output_consolidated")
     output_dir.mkdir(exist_ok=True)
     final_archive_path = output_dir / CONSOLIDATED_FILENAME
     cursor = db_conn.cursor()
     cursor.execute("SELECT COUNT(id) FROM movies")
     total_unique_movies = cursor.fetchone()[0]
+    
     if total_unique_movies == 0:
         logging.warning("Database is empty. Nothing to upload. Exiting.")
         db_conn.close()
-        os.remove(DB_FILENAME)
+        if os.path.exists(DB_FILENAME):
+            os.remove(DB_FILENAME)
         sys.exit(0)
 
     logging.info(f"Writing {total_unique_movies} unique movies to new archive: {final_archive_path}...")
     cursor.execute("SELECT data FROM movies ORDER BY id ASC")
     with gzip.open(final_archive_path, 'wt', encoding='utf-8') as f:
         while True:
-            rows = cursor.fetchmany(5000)
+            rows = cursor.fetchmany(BATCH_SIZE)
             if not rows: break
             for row in rows: f.write(row[0] + '\n')
     db_conn.close()
 
-    # 4. Загрузка нового файла и удаление старых чанков
-    logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
-    api.upload_file(
-        path_or_fileobj=str(final_archive_path),
-        path_in_repo=consolidated_repo_path,
-        repo_id=DATASET_ID, repo_type="dataset"
-    )
+    try:
+        logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
+        api.upload_file(
+            path_or_fileobj=str(final_archive_path),
+            path_in_repo=consolidated_repo_path,
+            repo_id=DATASET_ID, repo_type="dataset"
+        )
+    except Exception as e:
+        logging.critical(f"CRITICAL: Failed to upload new consolidated file: {e}", exc_info=True)
+        sys.exit(1)
+
     if raw_files_in_repo:
         logging.info(f"Deleting {len(raw_files_in_repo)} processed raw files...")
         try:
