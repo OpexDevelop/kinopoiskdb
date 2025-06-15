@@ -185,8 +185,9 @@ def run_retrier(failed_pages_list: list, api_key: str, requests_limit: int):
         future_to_task = {}
         for task in tasks_to_retry:
             date_obj = datetime.strptime(task['date'], '%Y-%m-%d').date()
-            date_str_for_req = date_obj.strftime('%d.%m.%Y')
-            future = executor.submit(fetch_page, api_key, date_str_for_req, task['page'], "RETRIER")
+            next_date = date_obj + timedelta(days=1)
+            date_range = f"{date_obj.strftime('%d.%m.%Y')}-{next_date.strftime('%d.%m.%Y')}"
+            future = executor.submit(fetch_page, api_key, date_range, task['page'], "RETRIER")
             future_to_task[future] = task
             requests_used += 1
 
@@ -210,7 +211,7 @@ def run_retrier(failed_pages_list: list, api_key: str, requests_limit: int):
 
 
 def run_miner(state: dict, api_key: str, requests_limit: int):
-    """РЕЖИМ "ШАХТЁРА"."""
+    """РЕЖИМ "ШАХТЁРА" - параллельное скачивание всех страниц найденного "месторождения"."""
     miner_state = state["miner_state"]
     drilling_date_str = miner_state["drilling_date"]
     start_page = miner_state["last_completed_page"] + 1
@@ -221,20 +222,44 @@ def run_miner(state: dict, api_key: str, requests_limit: int):
     newly_failed_pages = []
 
     drilling_date_obj = datetime.strptime(drilling_date_str, '%Y-%m-%d').date()
-    date_for_req = drilling_date_obj.strftime('%d.%m.%Y')
+    next_date_obj = drilling_date_obj + timedelta(days=1)
+    date_range_for_req = f"{drilling_date_obj.strftime('%d.%m.%Y')}-{next_date_obj.strftime('%d.%m.%Y')}"
 
     if total_pages == 0:
-        if requests_used >= requests_limit: return collected_movies, requests_used, False, newly_failed_pages
-        logging.info(f"[MINER] Контрольный запрос для даты {date_for_req}, чтобы узнать общее кол-во страниц.")
-        data = fetch_page(api_key, date_for_req, 2, "MINER_CONTROL")
+        if requests_used >= requests_limit: 
+            return collected_movies, requests_used, False, newly_failed_pages
+            
+        logging.info(f"[MINER] Контрольный запрос для диапазона {date_range_for_req}, чтобы узнать общее кол-во страниц.")
+        data = fetch_page(api_key, date_range_for_req, 1, "MINER_CONTROL")
         requests_used += 1
-        total_pages = data.get('pages', start_page)
+        total_pages = data.get('pages', 0)
         miner_state["total_pages"] = total_pages
         logging.info(f"[MINER] В дне {drilling_date_str} найдено {total_pages} страниц.")
 
-    pages_to_drill = list(range(start_page, total_pages + 1))
+        # Добавляем первую страницу к собранным фильмам
+        docs = data.get('docs', [])
+        if docs:
+            collected_movies.extend(docs)
+            miner_state["last_completed_page"] = 1
+            
+        # Запрашиваем вторую страницу
+        if total_pages > 1 and requests_used < requests_limit:
+            try:
+                data = fetch_page(api_key, date_range_for_req, 2, "MINER_SECOND_PAGE")
+                requests_used += 1
+                docs = data.get('docs', [])
+                log_data_summary(docs, "MINER_SECOND_PAGE")
+                if docs:
+                    collected_movies.extend(docs)
+                    miner_state["last_completed_page"] = 2
+            except Exception as e:
+                logging.error(f"[MINER_SECOND_PAGE] Ошибка при скачивании страницы 2 для {drilling_date_str}: {e}")
+                newly_failed_pages.append({"date": drilling_date_str, "page": 2})
+                
+    # Страницы 3+ идут параллельно
+    pages_to_drill = list(range(max(start_page, 3), total_pages + 1))
     if not pages_to_drill:
-        return [], 0, True, []
+        return collected_movies, requests_used, True, []
 
     with ThreadPoolExecutor(max_workers=MAX_MINER_WORKERS) as executor:
         future_to_page = {}
@@ -243,7 +268,7 @@ def run_miner(state: dict, api_key: str, requests_limit: int):
                 logging.warning("[MINER] Достигнут лимит запросов, приостановка бурения.")
                 break
             
-            future = executor.submit(fetch_page, api_key, date_for_req, page, "MINER_WORKER")
+            future = executor.submit(fetch_page, api_key, date_range_for_req, page, "MINER_WORKER")
             future_to_page[future] = page
             requests_used += 1
 
@@ -265,8 +290,9 @@ def run_miner(state: dict, api_key: str, requests_limit: int):
 
 
 def run_scout(state: dict, api_key: str, requests_limit: int):
-    """РЕЖИM "РАЗВЕДЧИКА"."""
-    if requests_limit <= 0: return [], 0, None, []
+    """РЕЖИМ "РАЗВЕДЧИКА" - последовательный поиск "месторождений" данных."""
+    if requests_limit <= 0: 
+        return [], 0, None, []
 
     scout_state = state["scout_state"]
     start_date_str = scout_state["next_scan_start_date"]
@@ -280,62 +306,66 @@ def run_scout(state: dict, api_key: str, requests_limit: int):
     collected_movies = []
     newly_failed_pages = []
     
-    logging.info(f"[SCOUT] Фаза 1: Зондирование диапазона {date_range_for_req}")
+    # Начинаем с первой страницы
+    logging.info(f"[SCOUT] Зондирование диапазона {date_range_for_req}")
     try:
         data = fetch_page(api_key, date_range_for_req, 1, "SCOUT_PROBE")
         requests_used += 1
         docs = data.get('docs', [])
         date_counts = log_data_summary(docs, "SCOUT_PROBE")
+        
+        total_pages = data.get('pages', 0)
+        
+        if total_pages <= 1 and not docs:
+            logging.info("[SCOUT] Диапазон пуст. Сохраняем текущую начальную дату для повторной проверки в следующем запуске.")
+            return [], requests_used, None, []
+            
+        # Проверяем, есть ли на странице 1 только одна дата (месторождение)
+        if date_counts and len(date_counts) == 1:
+            motherlode_date = list(date_counts.keys())[0]
+            logging.info(f"[SCOUT] Найдено 'месторождение' данных на первой странице с датой {motherlode_date}!")
+            next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
+            scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
+            return docs, requests_used, motherlode_date, []
+            
+        # Добавляем первую страницу к собранным фильмам
+        collected_movies.extend(docs)
+        
+        # Последовательно проверяем страницы 2+ того же диапазона, пока не найдем месторождение
+        page = 2
+        while page <= total_pages and requests_used < requests_limit:
+            try:
+                data = fetch_page(api_key, date_range_for_req, page, "SCOUT_COLLECT")
+                requests_used += 1
+                docs_page = data.get('docs', [])
+                date_counts = log_data_summary(docs_page, f"SCOUT_COLLECT page {page}")
+                
+                if not docs_page:
+                    break
+                    
+                # Если на текущей странице все фильмы имеют одну дату - нашли "месторождение"
+                if date_counts and len(date_counts) == 1:
+                    motherlode_date = list(date_counts.keys())[0]
+                    logging.info(f"[SCOUT] Найдено 'месторождение' данных на странице {page} с датой {motherlode_date}!")
+                    next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
+                    scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
+                    collected_movies.extend(docs_page)
+                    return collected_movies, requests_used, motherlode_date, []
+                
+                collected_movies.extend(docs_page)
+                page += 1
+                
+            except Exception as e:
+                logging.error(f"[SCOUT_COLLECT] Ошибка при сборе страницы {page} из диапазона {date_range_for_req}: {e}")
+                newly_failed_pages.append({"date": start_date_str, "page": page})
+                break
+                
     except Exception as e:
         logging.error(f"[SCOUT_PROBE] Ошибка при зондировании диапазона {date_range_for_req}: {e}")
         return [], 0, None, []
-        
-    pages = data.get('pages', 0)
-
-    if pages <= 1 and not docs:
-        logging.info("[SCOUT] Диапазон пуст. Сохраняем текущую начальную дату для повторной проверки в следующем запуске.")
-        return [], requests_used, None, []
-
-    # Проверяем, есть ли на первой странице только одна дата
-    if date_counts and len(date_counts) == 1:
-        motherlode_date = list(date_counts.keys())[0]
-        logging.info(f"[SCOUT] Найдено 'месторождение' данных на дату {motherlode_date}!")
-        next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
-        scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
-        return docs, requests_used, motherlode_date, []
-
-    # Добавляем первую страницу к собранным фильмам
-    collected_movies.extend(docs)
-    
-    # Проверяем последующие страницы по одной, пока не найдем страницу с одной датой
-    page = 2
-    while page <= pages and requests_used < requests_limit:
-        try:
-            data = fetch_page(api_key, date_range_for_req, page, "SCOUT_COLLECT")
-            requests_used += 1
-            docs_page = data.get('docs', [])
-            date_counts = log_data_summary(docs_page, f"SCOUT_COLLECT page {page}")
-            
-            if not docs_page:
-                break
-                
-            # Если на текущей странице все фильмы имеют одну дату - нашли "месторождение"
-            if date_counts and len(date_counts) == 1:
-                motherlode_date = list(date_counts.keys())[0]
-                logging.info(f"[SCOUT] Найдено 'месторождение' данных на странице {page} с датой {motherlode_date}!")
-                next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
-                scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
-                collected_movies.extend(docs_page)
-                return collected_movies, requests_used, motherlode_date, []
-            
-            collected_movies.extend(docs_page)
-            page += 1
-            
-        except Exception as e:
-            logging.error(f"[SCOUT_COLLECT] Ошибка при сборе страницы {page} из диапазона {date_range_for_req}: {e}")
-            break
     
     # Если "месторождение" не найдено, обновляем начальную дату для следующего запуска
+    # на основе последнего собранного фильма
     if collected_movies:
         last_movie_date_str = collected_movies[-1].get('updatedAt', '').split('T')[0]
         if last_movie_date_str:
@@ -376,6 +406,7 @@ def main():
     all_collected_movies = []
     
     try:
+        # Сначала обрабатываем сбойные страницы
         remaining_req = max_requests - requests_processed
         retry_movies, req_used, _, state["failed_pages"] = run_retrier(
             state.get("failed_pages", []), api_key, remaining_req
@@ -383,9 +414,11 @@ def main():
         all_collected_movies.extend(retry_movies)
         requests_processed += req_used
 
+        # Основной цикл
         while requests_processed < max_requests:
             remaining_req = max_requests - requests_processed
             
+            # Если активен режим "Шахтёра" - обрабатываем его приоритетно
             if state["miner_state"]["is_drilling"]:
                 logging.info("--- Обнаружена активная задача 'Шахтёра'. Возобновление. ---")
                 miner_movies, req_used, finished, failed = run_miner(state, api_key, remaining_req)
@@ -402,6 +435,7 @@ def main():
                 update_state(api, state)
                 continue
 
+            # Если "Шахтёр" не активен - запускаем "Разведчика"
             logging.info("--- 'Шахтёр' неактивен. Запуск 'Разведчика'. ---")
             scout_movies, req_used, motherlode_date, failed = run_scout(state, api_key, remaining_req)
             all_collected_movies.extend(scout_movies)
@@ -410,20 +444,11 @@ def main():
 
             if motherlode_date:
                 logging.info(f"--- 'Разведчик' передал задачу 'Шахтёру' для даты {motherlode_date} ---")
-                state["miner_state"] = {"is_drilling": True, "drilling_date": motherlode_date, "last_completed_page": 1, "total_pages": 0}
+                state["miner_state"] = {"is_drilling": True, "drilling_date": motherlode_date, "last_completed_page": 0, "total_pages": 0}
             
             if req_used == 0 or not motherlode_date:
                  logging.info("--- 'Разведчик' завершил свой цикл на этот запуск. ---")
                  break
 
     except (RateLimitException, KeyboardInterrupt) as e:
-        logging.warning(f"Работа прервана: {e}. Сохранение текущего состояния.")
-    except Exception as e:
-        logging.critical(f"Непредвиденная критическая ошибка: {e}", exc_info=True)
-    finally:
-        save_data_chunk(api, all_collected_movies)
-        update_state(api, state)
-        logging.info(f"\nЗапуск завершен. Всего использовано запросов: {requests_processed}.")
-
-if __name__ == "__main__":
-    main()
+        logging.warning(f"Работа прервана: {e}. Сохранение теку
