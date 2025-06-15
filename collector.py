@@ -133,11 +133,11 @@ def save_data_chunk(api: HfApi, collected_movies: list):
 # --- ЛОГИКА API ЗАПРОСОВ ---
 
 def log_data_summary(docs: list, req_type: str):
-    """НОВАЯ ФУНКЦИЯ: Создает и логирует детальную сводку по полученным данным."""
+    """Создает и логирует детальную сводку по полученным данным."""
     if not docs:
         logging.info(f"[{req_type}] Найдено 0 фильмов.")
-        return
-
+        return None
+    
     movie_count = len(docs)
     
     date_counts = Counter(d.get('updatedAt', '').split('T')[0] for d in docs if d.get('updatedAt'))
@@ -150,6 +150,8 @@ def log_data_summary(docs: list, req_type: str):
                f"Распределение: [ {date_distribution_str} ]")
     
     logging.info(f"[{req_type}] {summary}")
+    
+    return date_counts
 
 def fetch_page(api_key: str, date_for_req: str, page: int, req_type: str = "REQUEST"):
     """Универсальная функция для запросов к API."""
@@ -283,7 +285,7 @@ def run_scout(state: dict, api_key: str, requests_limit: int):
         data = fetch_page(api_key, date_range_for_req, 1, "SCOUT_PROBE")
         requests_used += 1
         docs = data.get('docs', [])
-        log_data_summary(docs, "SCOUT_PROBE")
+        date_counts = log_data_summary(docs, "SCOUT_PROBE")
     except Exception as e:
         logging.error(f"[SCOUT_PROBE] Ошибка при зондировании диапазона {date_range_for_req}: {e}")
         return [], 0, None, []
@@ -294,33 +296,46 @@ def run_scout(state: dict, api_key: str, requests_limit: int):
         logging.info("[SCOUT] Диапазон пуст. Сохраняем текущую начальную дату для повторной проверки в следующем запуске.")
         return [], requests_used, None, []
 
-    dates_on_page = {d.get('updatedAt', '').split('T')[0] for d in docs if d.get('updatedAt')}
-    is_single_date = len(dates_on_page) == 1
-
-    if is_single_date:
-        motherlode_date = list(dates_on_page)[0]
+    # Проверяем, есть ли на первой странице только одна дата
+    if date_counts and len(date_counts) == 1:
+        motherlode_date = list(date_counts.keys())[0]
         logging.info(f"[SCOUT] Найдено 'месторождение' данных на дату {motherlode_date}!")
         next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
         scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
         return docs, requests_used, motherlode_date, []
 
-    logging.info("[SCOUT] Найдены разрозненные данные. Последовательный сбор...")
+    # Добавляем первую страницу к собранным фильмам
     collected_movies.extend(docs)
+    
+    # Проверяем последующие страницы по одной, пока не найдем страницу с одной датой
     page = 2
     while page <= pages and requests_used < requests_limit:
         try:
             data = fetch_page(api_key, date_range_for_req, page, "SCOUT_COLLECT")
             requests_used += 1
             docs_page = data.get('docs', [])
-            log_data_summary(docs_page, f"SCOUT_COLLECT page {page}")
+            date_counts = log_data_summary(docs_page, f"SCOUT_COLLECT page {page}")
+            
             if not docs_page:
                 break
+                
+            # Если на текущей странице все фильмы имеют одну дату - нашли "месторождение"
+            if date_counts and len(date_counts) == 1:
+                motherlode_date = list(date_counts.keys())[0]
+                logging.info(f"[SCOUT] Найдено 'месторождение' данных на странице {page} с датой {motherlode_date}!")
+                next_day = datetime.strptime(motherlode_date, '%Y-%m-%d').date() + timedelta(days=1)
+                scout_state["next_scan_start_date"] = next_day.strftime('%Y-%m-%d')
+                collected_movies.extend(docs_page)
+                return collected_movies, requests_used, motherlode_date, []
+            
             collected_movies.extend(docs_page)
             page += 1
+            
         except Exception as e:
             logging.error(f"[SCOUT_COLLECT] Ошибка при сборе страницы {page} из диапазона {date_range_for_req}: {e}")
             break
     
+    # Если "месторождение" не найдено, обновляем начальную дату для следующего запуска
     if collected_movies:
         last_movie_date_str = collected_movies[-1].get('updatedAt', '').split('T')[0]
         if last_movie_date_str:
@@ -412,4 +427,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
