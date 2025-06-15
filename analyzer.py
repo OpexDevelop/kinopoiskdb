@@ -31,7 +31,8 @@ def get_required_env_var(var_name):
     """Получает переменную окружения или завершает работу, если она не установлена."""
     value = os.getenv(var_name)
     if not value:
-        [span_0](start_span)logging.critical(f"Error: Environment variable {var_name} is not set.")[span_0](end_span)
+        # ИСПРАВЛЕНО: Добавлен правильный отступ для блока if
+        logging.critical(f"Error: Environment variable {var_name} is not set.")
         sys.exit(1)
     return value
 
@@ -47,11 +48,11 @@ def main():
     try:
         logging.info(f"Attempting to download main consolidated file: {consolidated_repo_path}...")
         local_consolidated_path = hf_hub_download(
-            [span_1](start_span)repo_id=DATASET_ID, filename=consolidated_repo_path, repo_type="dataset"[span_1](end_span)
+            repo_id=DATASET_ID, filename=consolidated_repo_path, repo_type="dataset"
         )
         logging.info(f"Successfully downloaded to {local_consolidated_path}")
     except EntryNotFoundError:
-        [span_2](start_span)logging.critical("Main consolidated file not found. Nothing to analyze. Exiting.")[span_2](end_span)
+        logging.critical("Main consolidated file not found. Nothing to analyze. Exiting.")
         sys.exit(1)
     except Exception as e:
         logging.critical(f"An unexpected error occurred when downloading the main file: {e}", exc_info=True)
@@ -78,12 +79,12 @@ def main():
             for i, line in enumerate(f):
                 total_entries += 1
                 try:
-                    [span_3](start_span)movie = json.loads(line)[span_3](end_span)
+                    movie = json.loads(line)
 
                     # 1. Анализ по дате обновления (updatedAt)
                     updated_at_str = movie.get("updatedAt")
                     if updated_at_str:
-                        [span_4](start_span)dt_object = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))[span_4](end_span)
+                        dt_object = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))
                         date_key = dt_object.strftime('%Y-%m-%d')
                         date_counter[date_key] += 1
                         if first_update is None or dt_object < first_update:
@@ -135,8 +136,8 @@ def main():
                     else:
                         missing_data_counter['rating.kp'] += 1
 
-                [span_5](start_span)except (json.JSONDecodeError, ValueError) as e:[span_5](end_span)
-                    [span_6](start_span)logging.warning(f"Could not process line {i+1}. Error: {e}. Skipping line.")[span_6](end_span)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logging.warning(f"Could not process line {i+1}. Error: {e}. Skipping line.")
                     entries_with_errors += 1
 
     except Exception as e:
@@ -159,7 +160,7 @@ def main():
             f.write(f"Период обновлений: с {first_update.strftime('%Y-%m-%d')} по {last_update.strftime('%Y-%m-%d')}\n")
         f.write(f"Строк с ошибками парсинга JSON: {entries_with_errors}\n\n")
 
-        # --- Статистика по отсутствующим данным ---
+        # --- Статистика по отсутствующим ключевым полям ---
         f.write("--- Статистика по отсутствующим ключевым полям ---\n")
         if not missing_data_counter:
             f.write("Все ключевые поля присутствуют во всех проанализированных записях.\n")
@@ -216,7 +217,7 @@ def main():
         f.write("\n")
 
         # --- Статистика обновлений по дням ---
-        [span_7](start_span)f.write("--- Статистика обновлений по дням (все дни) ---\n")[span_7](end_span)
+        f.write("--- Статистика обновлений по дням (все дни) ---\n")
         if not date_counter:
             f.write("Даты обновлений не найдены.\n")
         else:
@@ -230,4 +231,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+    
