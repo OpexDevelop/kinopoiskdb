@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError
@@ -43,10 +42,7 @@ def get_env_var(var_name, default=None):
     return value
 
 def get_collector_state(api: HfApi):
-    """
-    Получает состояние сборщика из репозитория.
-    Состояние хранит последнюю *успешно и последовательно* обработанную дату и страницу.
-    """
+    """Получает состояние сборщика из репозитория."""
     try:
         logging.info(f"Attempting to download state file: {STATE_FILENAME}")
         state_path = hf_hub_download(
@@ -68,10 +64,7 @@ def get_collector_state(api: HfApi):
         return DEFAULT_START_DATE, 0, []
 
 def update_collector_state(api: HfApi, date_str: str, page_num: int, failed_pages: list):
-    """
-    Обновляет файл состояния в репозитории.
-    Удаляет дубликаты из списка сбойных страниц перед сохранением.
-    """
+    """Обновляет файл состояния в репозитории."""
     unique_failed = [dict(t) for t in {tuple(d.items()) for d in failed_pages}]
     state = {"last_date": date_str, "last_page_completed": page_num, "failed_pages": unique_failed}
     local_state_path = Path(STATE_FILENAME)
@@ -84,16 +77,8 @@ def update_collector_state(api: HfApi, date_str: str, page_num: int, failed_page
         repo_id=DATASET_ID, repo_type="dataset"
     )
 
-def fetch_page(task, api_key):
-    """
-    Запрашивает одну страницу по данным из объекта 'task'.
-    'task' - это словарь вида {'date': 'ГГГГ-ММ-ДД', 'page': N}.
-    """
-    date_obj = datetime.strptime(task['date'], '%Y-%m-%d').date()
-    # API ожидает дату в формате ДД.ММ.ГГГГ
-    date_str_for_req = date_obj.strftime('%d.%m.%Y')
-    page = task['page']
-
+def fetch_page(date_str_for_req, page, api_key):
+    """Запрашивает одну страницу для определенной даты (формат ДД.ММ.ГГГГ)."""
     params = {
         'page': page, 'limit': 250, 'sortField': 'updatedAt', 'sortType': '1',
         'updatedAt': date_str_for_req,
@@ -102,75 +87,62 @@ def fetch_page(task, api_key):
     headers = {"X-API-KEY": api_key}
     logging.info(f"Requesting page {page} for date {date_str_for_req}...")
     response = requests.get(API_BASE_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-
     if response.status_code == 403:
         raise RateLimitException(f"Rate limit exceeded (403 Forbidden) for key ending '...{api_key[-4:]}'.")
-
-    response.raise_for_status() # Вызовет исключение для других ошибок (4xx, 5xx)
+    response.raise_for_status()
     return response.json()
 
-def calculate_new_state(last_known_date_str, last_known_page, successful_tasks):
-    """
-    Вычисляет новое состояние на основе списка успешно выполненных задач.
-    Находит последнюю НЕПРЕРЫВНУЮ последовательность успешно скачанных страниц.
-    """
-    # Создаем словарь, где ключ - дата, значение - отсортированный список успешных страниц
-    completed_by_date = defaultdict(list)
-    for task in successful_tasks:
-        completed_by_date[task['date']].append(task['page'])
-    for date in completed_by_date:
-        completed_by_date[date].sort()
+def process_failed_tasks(failed_pages, api_key, max_tasks):
+    """Параллельно обрабатывает список ранее неудавшихся задач."""
+    if not failed_pages:
+        return [], [], []
 
-    # Начинаем с последней известной точки
-    current_date = datetime.strptime(last_known_date_str, '%Y-%m-%d').date()
-    current_page = last_known_page
+    logging.info(f"--- Starting RETRY phase for {len(failed_pages)} failed pages ---")
+    tasks_to_retry = failed_pages[:max_tasks]
+    remaining_failed = failed_pages[max_tasks:]
     
-    # Сортируем даты, чтобы проверять их по порядку
-    sorted_dates = sorted(completed_by_date.keys())
+    collected_movies = []
+    still_failing = list(remaining_failed)
+    successfully_retried = []
 
-    while True:
-        current_date_str = current_date.strftime('%Y-%m-%d')
-        # Если текущей даты нет в словаре успешных, значит последовательность прервалась
-        if current_date_str not in completed_by_date:
-            break
-
-        # Проверяем страницы для текущей даты
-        expected_page = current_page + 1
-        pages_for_date = completed_by_date[current_date_str]
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+        future_to_task = {}
+        for task in tasks_to_retry:
+            date_obj = datetime.strptime(task['date'], '%Y-%m-%d').date()
+            date_str_for_req = date_obj.strftime('%d.%m.%Y')
+            future = executor.submit(fetch_page, date_str_for_req, task['page'], api_key)
+            future_to_task[future] = task
         
-        found_break = False
-        while expected_page in pages_for_date:
-            current_page = expected_page
-            expected_page += 1
-        
-        # Если мы не нашли следующую страницу, но это не последняя страница
-        # (т.е. есть пропуски), то последовательность прервана
-        if current_page < max(pages_for_date):
-             # Проверяем, есть ли разрывы
-            if (current_page + 1) not in pages_for_date:
-                 found_break = True
-
-        if found_break:
-            break
-
-        # Если дошли до конца дня, переходим на следующий день
-        current_date += timedelta(days=1)
-        current_page = 0
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                data = future.result()
+                if data and data.get('docs'):
+                    collected_movies.extend(data['docs'])
+                    successfully_retried.append(task)
+                    logging.info(f"[RETRY SUCCESS] Fetched page {task['page']} for date {task['date']}")
+                else:
+                    logging.warning(f"[RETRY OK] Page {task['page']} for {task['date']} was empty. Removing from retry list.")
+                    successfully_retried.append(task) # Считаем успешным, чтобы не повторять снова
+            except Exception as exc:
+                logging.error(f"[RETRY FAIL] Page {task['page']} for date {task['date']} failed again: {exc}")
+                still_failing.append(task)
     
-    return current_date_str, current_page
+    # Убираем успешно обработанные из общего списка сбойных
+    final_failed_list = [t for t in still_failing if t not in successfully_retried]
+    return collected_movies, final_failed_list, tasks_to_retry
 
 
 def main():
     hf_token = get_env_var("HF_TOKEN")
     api_keys_str = get_env_var("KINOPOISK_API_KEYS")
-    max_requests = int(get_env_var("MAX_REQUESTS_PER_RUN", "200"))
+    max_requests_total = int(get_env_var("MAX_REQUESTS_PER_RUN", "200"))
     
     api_keys = [key.strip() for key in api_keys_str.split(',') if key.strip()]
     if not api_keys:
         logging.critical("No API keys provided in KINOPOISK_API_KEYS secret.")
         sys.exit(1)
 
-    # Используем циклический доступ к ключам, чтобы работать с любым их количеством
     current_hour = datetime.utcnow().hour
     api_key = api_keys[current_hour % len(api_keys)]
     logging.info(f"Current UTC hour is {current_hour}. Using API key index #{current_hour % len(api_keys)}.")
@@ -179,107 +151,80 @@ def main():
     
     # Получаем исходное состояние
     last_date_str, last_page_completed, failed_pages = get_collector_state(api)
-
-    requests_processed = 0
-    collected_movies = []
-    successful_tasks = []
     
-    # Этот словарь будет отслеживать дни, для которых мы знаем, что страниц больше нет
-    # Ключ: дата (str), Значение: общее кол-во страниц (int)
-    known_total_pages = {}
+    requests_processed = 0
+    all_collected_movies = []
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
-            futures = {}
+        # --- ФАЗА 1: ПОВТОРНАЯ ПОПЫТКА ДЛЯ СБОЙНЫХ СТРАНИЦ ---
+        retry_movies, failed_pages, tasks_retried = process_failed_tasks(
+            failed_pages, api_key, max_tasks=max_requests_total
+        )
+        all_collected_movies.extend(retry_movies)
+        requests_processed += len(tasks_retried)
 
-            # --- ФАЗА 1: ПОВТОРНАЯ ПОПЫТКА ДЛЯ СБОЙНЫХ СТРАНИЦ ---
-            if failed_pages and requests_processed < max_requests:
-                logging.info(f"--- Starting RETRY phase for {len(failed_pages)} failed pages ---")
-                
-                # Создаем задачи для сбойных страниц
-                tasks_to_retry = failed_pages[:(max_requests - requests_processed)]
-                for task in tasks_to_retry:
-                    # Подаем задачу в executor и сохраняем future
-                    future = executor.submit(fetch_page, task, api_key)
-                    futures[future] = task
-                
-                # Оставшиеся сбои, которые не попали в этот запуск
-                failed_pages = failed_pages[len(tasks_to_retry):]
-
-            # --- ФАЗА 2: ГЕНЕРАЦИЯ И ВЫПОЛНЕНИЕ НОВЫХ ЗАДАЧ ---
-            logging.info(f"--- Starting MAIN collection from {last_date_str} page {last_page_completed + 1} ---")
+        # --- ФАЗА 2: ОСНОВНОЙ СБОР - ПОСЛЕДОВАТЕЛЬНО ПО ДНЯМ ---
+        date_to_process = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+        
+        while requests_processed < max_requests_total:
+            if date_to_process > datetime.utcnow().date() + timedelta(days=1):
+                logging.info("Target date is in the future. Stopping.")
+                break
             
-            # Начинаем генерацию задач с последней известной точки
-            date_to_process = datetime.strptime(last_date_str, '%Y-%m-%d').date()
-            page_to_process = last_page_completed + 1
-
-            while len(futures) < max_requests:
-                # Остановка, если дата ушла слишком далеко в будущее
-                if date_to_process > datetime.utcnow().date() + timedelta(days=1):
-                    logging.info("Target date is in the future. Stopping task generation.")
-                    break
-                
-                current_date_str = date_to_process.strftime('%Y-%m-%d')
-
-                # Если мы знаем, что для этой даты больше нет страниц, пропускаем ее
-                if current_date_str in known_total_pages and page_to_process > known_total_pages[current_date_str]:
-                    date_to_process += timedelta(days=1)
-                    page_to_process = 1
-                    continue
-                
-                # Создаем и отправляем новую задачу
-                task = {'date': current_date_str, 'page': page_to_process}
-                future = executor.submit(fetch_page, task, api_key)
-                futures[future] = task
-
-                page_to_process += 1
-
-            # --- ФАЗА 3: ОБРАБОТКА РЕЗУЛЬТАТОВ ПО МЕРЕ ИХ ПОСТУПЛЕНИЯ ---
-            logging.info(f"--- Processing {len(futures)} tasks in parallel ---")
-            for future in as_completed(futures):
-                task = futures[future]
-                requests_processed += 1
+            # Если мы обрабатываем дату из состояния, начинаем с последней страницы.
+            # Если это новый день, начинаем с 1-й страницы.
+            page = last_page_completed + 1 if date_to_process.strftime('%Y-%m-%d') == last_date_str else 1
+            
+            date_str_for_req = date_to_process.strftime('%d.%m.%Y')
+            logging.info(f"--- Starting to process date {date_str_for_req} from page {page} ---")
+            
+            while requests_processed < max_requests_total:
                 try:
-                    data = future.result()
-                    docs = data.get('docs')
+                    data = fetch_page(date_str_for_req, page, api_key)
+                    requests_processed += 1
                     
-                    if docs:
-                        collected_movies.extend(docs)
-                        successful_tasks.append(task)
-                        logging.info(f"[SUCCESS] Fetched page {task['page']} for date {task['date']}. Movies: {len(docs)}")
-                        
-                        # Сохраняем информацию об общем количестве страниц для этой даты
-                        total_pages = data.get('pages', task['page'])
-                        known_total_pages[task['date']] = total_pages
-                    else:
-                        # Если данных нет, значит, это последняя страница для этой даты
-                        logging.warning(f"[OK/EMPTY] Page {task['page']} for {task['date']} was empty. Assuming end of day.")
-                        known_total_pages[task['date']] = task['page'] - 1
+                    if not data or not data.get('docs'):
+                        logging.info(f"No more data for date {date_str_for_req}. Moving to the next day.")
+                        # День закончен, переходим к следующему
+                        date_to_process += timedelta(days=1)
+                        last_page_completed = 0 # Сбрасываем счетчик страниц для нового дня
+                        break # Выходим из цикла страниц, чтобы перейти к следующей дате
+                    
+                    all_collected_movies.extend(data['docs'])
+                    last_page_completed = page
+                    logging.info(f"Success on page {page} for {date_str_for_req}. Total pages: {data.get('pages', page)}.")
+                    page += 1
 
                 except Exception as exc:
-                    logging.error(f"[FAIL] Page {task['page']} for date {task['date']} failed: {exc}")
-                    failed_pages.append(task)
+                    logging.error(f"Request failed for date {date_str_for_req}, page {page}: {exc}")
+                    failed_pages.append({"date": date_to_process.strftime('%Y-%m-%d'), "page": page})
                     if isinstance(exc, RateLimitException):
-                        # При исчерпании лимита ключа нет смысла продолжать
-                        raise
+                        raise # Если кончился лимит, нет смысла продолжать
+                    
+                    # Если другая ошибка, просто переходим к следующему дню, чтобы не застрять
+                    date_to_process += timedelta(days=1)
+                    last_page_completed = 0
+                    break
+            
+            # Сохраняем последнюю дату, до которой дошли
+            last_date_str = date_to_process.strftime('%Y-%m-%d')
 
-    except (RateLimitException, KeyboardInterrupt, Exception) as e:
+    except (RateLimitException, KeyboardInterrupt) as e:
         logging.warning(f"Collection stopped unexpectedly by {type(e).__name__}: {e}. Saving current state.")
     finally:
-        # --- ФАЗА 4: СОХРАНЕНИЕ РЕЗУЛЬТАТОВ И СОСТОЯНИЯ ---
-        if collected_movies:
-            logging.info(f"\nCollected {len(collected_movies)} movies this run.")
+        # --- ФАЗА 3: СОХРАНЕНИЕ РЕЗУЛЬТАТОВ И СОСТОЯНИЯ ---
+        if all_collected_movies:
+            logging.info(f"\nCollected {len(all_collected_movies)} movies this run.")
             output_dir = Path("output_raw")
             output_dir.mkdir(exist_ok=True)
             timestamp_str = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
             archive_filename = f"raw_chunk_{timestamp_str}.jsonl.gz"
             local_archive_path = output_dir / archive_filename
             
-            # Сортировка для консистентности, хотя и не строго обязательна
-            collected_movies.sort(key=lambda m: m.get('updatedAt', ''))
+            all_collected_movies.sort(key=lambda m: m.get('updatedAt', ''))
             
             with gzip.open(local_archive_path, 'wt', encoding='utf-8') as f:
-                for movie in collected_movies:
+                for movie in all_collected_movies:
                     f.write(json.dumps(movie, ensure_ascii=False) + '\n')
             logging.info(f"Saved data to {local_archive_path}")
             
@@ -292,14 +237,11 @@ def main():
                 logging.info("Raw chunk upload successful.")
             except Exception as e:
                 logging.critical(f"Failed to upload data chunk: {e}", exc_info=True)
-                sys.exit(1)
         else:
             logging.info("No new movies collected in this run.")
         
         try:
-            # Вычисляем новое состояние на основе всех успешных задач
-            new_date_str, new_page_num = calculate_new_state(last_date_str, last_page_completed, successful_tasks)
-            update_collector_state(api, new_date_str, new_page_num, failed_pages)
+            update_collector_state(api, last_date_str, last_page_completed, failed_pages)
         except Exception as e:
             logging.critical(f"CRITICAL: Failed to update FINAL state: {e}", exc_info=True)
             sys.exit(1)
