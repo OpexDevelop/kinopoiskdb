@@ -27,10 +27,9 @@ jobs:
       - name: Install dependencies
         run: pip install requests huggingface_hub
 
-      # 4. Запускаем наш скрипт для ручной консолидации
-      - name: Run manual consolidator script
+      # 4. Запускаем наш основной скрипт для консолидации
+      - name: Run consolidator script
         env:
           # Передаем токен для доступа к Hugging Face из секретов репозитория
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python manual_consolidator.py
-
+        run: python consolidator.py
