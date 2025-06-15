@@ -8,10 +8,10 @@ import threading
 import random
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- КОНФИГУРАЦИЯ ---
-# (Конфигурация остается без изменений)
 HF_USERNAME = "opex792"
 DATASET_ID = f"{HF_USERNAME}/kinopoisk"
 RAW_DATA_DIR = "raw_data"
@@ -20,7 +20,6 @@ API_BASE_URL = "https://api.kinopoisk.dev/v1.4/movie"
 REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_START_DATE = "2000-01-01"
 MAX_MINER_WORKERS = 15
-# ИЗМЕНЕНИЕ: Максимальное количество одновременных запросов для повторных попыток
 MAX_RETRY_WORKERS = 10
 
 # --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
@@ -53,9 +52,7 @@ def get_env_var(var_name, default=None):
 STATE_FILE_LOCK = threading.Lock()
 
 def get_state(api: HfApi):
-    """
-    Скачивает файл состояния из репозитория Hugging Face.
-    """
+    """Скачивает файл состояния из репозитория Hugging Face."""
     default_state = {
         "scout_state": {"next_scan_start_date": DEFAULT_START_DATE},
         "miner_state": {"is_drilling": False, "drilling_date": None, "last_completed_page": 0, "total_pages": 0},
@@ -82,9 +79,7 @@ def get_state(api: HfApi):
         return default_state
 
 def update_state(api: HfApi, state: dict):
-    """
-    Сохраняет объект состояния в локальный файл и загружает его в репозиторий.
-    """
+    """Сохраняет объект состояния в локальный файл и загружает его в репозиторий."""
     with STATE_FILE_LOCK:
         if "failed_pages" in state and state["failed_pages"]:
             unique_failed = [dict(t) for t in {tuple(d.items()) for d in state["failed_pages"]}]
@@ -137,11 +132,27 @@ def save_data_chunk(api: HfApi, collected_movies: list):
 
 # --- ЛОГИКА API ЗАПРОСОВ ---
 
+def log_data_summary(docs: list, req_type: str):
+    """НОВАЯ ФУНКЦИЯ: Создает и логирует детальную сводку по полученным данным."""
+    if not docs:
+        logging.info(f"[{req_type}] Найдено 0 фильмов.")
+        return
+
+    movie_count = len(docs)
+    
+    date_counts = Counter(d.get('updatedAt', '').split('T')[0] for d in docs if d.get('updatedAt'))
+    unique_dates_count = len(date_counts)
+    
+    date_distribution_parts = [f"{date}: {count} фильм(ов)" for date, count in sorted(date_counts.items())]
+    date_distribution_str = "; ".join(date_distribution_parts)
+    
+    summary = (f"Найдено {movie_count} фильмов в {unique_dates_count} уникальных датах. "
+               f"Распределение: [ {date_distribution_str} ]")
+    
+    logging.info(f"[{req_type}] {summary}")
+
 def fetch_page(api_key: str, date_for_req: str, page: int, req_type: str = "REQUEST"):
-    """
-    Универсальная функция для запросов к API.
-    Принимает дату или диапазон в формате ДД.ММ.ГГГГ для параметра 'updatedAt'.
-    """
+    """Универсальная функция для запросов к API."""
     params = {'page': page, 'limit': 250, 'sortField': 'updatedAt', 'sortType': '1', 'updatedAt': date_for_req, 'selectFields': ''}
     headers = {"X-API-KEY": api_key}
     logging.info(f"[{req_type}] Запрос: страница {page}, дата/диапазон {date_for_req}")
@@ -155,9 +166,7 @@ def fetch_page(api_key: str, date_for_req: str, page: int, req_type: str = "REQU
 # --- РЕЖИМЫ РАБОТЫ ---
 
 def run_retrier(failed_pages_list: list, api_key: str, requests_limit: int):
-    """
-    "Восстановитель". Пытается параллельно скачать страницы из списка сбоев.
-    """
+    """"Восстановитель". Пытается параллельно скачать страницы из списка сбоев."""
     if not failed_pages_list or requests_limit <= 0:
         return [], 0, [], failed_pages_list
 
@@ -183,10 +192,11 @@ def run_retrier(failed_pages_list: list, api_key: str, requests_limit: int):
             task = future_to_task[future]
             try:
                 data = future.result()
-                if data and data.get('docs'):
-                    collected_movies.extend(data['docs'])
+                docs = data.get('docs', [])
+                log_data_summary(docs, f"RETRIER-SUCCESS page {task['page']}")
+                if docs:
+                    collected_movies.extend(docs)
                 successfully_retried_tasks.append(task)
-                logging.info(f"[RETRIER SUCCESS] Страница {task['page']} для даты {task['date']} успешно скачана.")
             except Exception as e:
                 logging.error(f"[RETRIER FAIL] Страница {task['page']} для {task['date']} снова не удалась: {e}")
                 still_failing_tasks.append(task)
@@ -198,9 +208,7 @@ def run_retrier(failed_pages_list: list, api_key: str, requests_limit: int):
 
 
 def run_miner(state: dict, api_key: str, requests_limit: int):
-    """
-    РЕЖИМ "ШАХТЁРА".
-    """
+    """РЕЖИМ "ШАХТЁРА"."""
     miner_state = state["miner_state"]
     drilling_date_str = miner_state["drilling_date"]
     start_page = miner_state["last_completed_page"] + 1
@@ -241,8 +249,10 @@ def run_miner(state: dict, api_key: str, requests_limit: int):
             page = future_to_page[future]
             try:
                 data = future.result()
-                if data and data.get('docs'):
-                    collected_movies.extend(data['docs'])
+                docs = data.get('docs', [])
+                log_data_summary(docs, f"MINER-WORKER page {page}")
+                if docs:
+                    collected_movies.extend(docs)
                 miner_state["last_completed_page"] = max(miner_state.get("last_completed_page", 0), page)
             except Exception as e:
                 logging.error(f"[MINER_WORKER] Ошибка при скачивании страницы {page} для {drilling_date_str}: {e}")
@@ -253,16 +263,13 @@ def run_miner(state: dict, api_key: str, requests_limit: int):
 
 
 def run_scout(state: dict, api_key: str, requests_limit: int):
-    """
-    РЕЖИM "РАЗВЕДЧИКА".
-    """
+    """РЕЖИM "РАЗВЕДЧИКА"."""
     if requests_limit <= 0: return [], 0, None, []
 
     scout_state = state["scout_state"]
     start_date_str = scout_state["next_scan_start_date"]
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     
-    # --- ИЗМЕНЕНИЕ №1: Конечная дата всегда 2050 год ---
     end_date_str = "01.01.2050"
     
     date_range_for_req = f"{start_date.strftime('%d.%m.%Y')}-{end_date_str}"
@@ -275,17 +282,16 @@ def run_scout(state: dict, api_key: str, requests_limit: int):
     try:
         data = fetch_page(api_key, date_range_for_req, 1, "SCOUT_PROBE")
         requests_used += 1
+        docs = data.get('docs', [])
+        log_data_summary(docs, "SCOUT_PROBE")
     except Exception as e:
         logging.error(f"[SCOUT_PROBE] Ошибка при зондировании диапазона {date_range_for_req}: {e}")
         return [], 0, None, []
         
-    docs = data.get('docs', [])
     pages = data.get('pages', 0)
 
-    # --- ИЗМЕНЕНИЕ №2: Логика для пустого диапазона ---
     if pages <= 1 and not docs:
         logging.info("[SCOUT] Диапазон пуст. Сохраняем текущую начальную дату для повторной проверки в следующем запуске.")
-        # Ничего не делаем с датой в state. При следующем запуске "Разведчик" начнет с той же даты.
         return [], requests_used, None, []
 
     dates_on_page = {d.get('updatedAt', '').split('T')[0] for d in docs if d.get('updatedAt')}
@@ -305,9 +311,11 @@ def run_scout(state: dict, api_key: str, requests_limit: int):
         try:
             data = fetch_page(api_key, date_range_for_req, page, "SCOUT_COLLECT")
             requests_used += 1
-            if not data or not data.get('docs'):
+            docs_page = data.get('docs', [])
+            log_data_summary(docs_page, f"SCOUT_COLLECT page {page}")
+            if not docs_page:
                 break
-            collected_movies.extend(data['docs'])
+            collected_movies.extend(docs_page)
             page += 1
         except Exception as e:
             logging.error(f"[SCOUT_COLLECT] Ошибка при сборе страницы {page} из диапазона {date_range_for_req}: {e}")
