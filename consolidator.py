@@ -6,7 +6,6 @@ import logging
 import sqlite3
 import tempfile
 import shutil
-import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -23,6 +22,9 @@ CONSOLIDATED_FILENAME = "kinopoisk.jsonl.gz"
 DB_FILENAME = "consolidation_db.sqlite"
 BATCH_SIZE = 5000
 FORCE_FULL_CLEANUP = True  # Установите True для принудительной очистки
+
+# Файлы, которые нужно сохранить при очистке
+FILES_TO_PRESERVE = ["README.md", ".gitattributes"]
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -66,6 +68,24 @@ def setup_database(db_path):
     db_conn.commit()
     return db_conn
 
+def fix_empty_structs(movie_data):
+    """Исправляет пустые структуры в данных фильма."""
+    if isinstance(movie_data, dict):
+        # Исправляем пустые структуры
+        for key, value in list(movie_data.items()):
+            if isinstance(value, dict) and not value:
+                # Заменяем пустые объекты на null
+                movie_data[key] = None
+            elif isinstance(value, dict):
+                # Рекурсивно обрабатываем вложенные объекты
+                fix_empty_structs(value)
+            elif isinstance(value, list):
+                # Обрабатываем элементы списка
+                for item in value:
+                    if isinstance(item, dict):
+                        fix_empty_structs(item)
+    return movie_data
+
 def process_file_into_db(file_path, db_conn, file_type="File"):
     """Читает файл .jsonl.gz и вставляет/обновляет данные в БД, избегая перезаписи более свежих данных старыми."""
     logging.info(f"Processing {file_type} into database: {Path(file_path).name}...")
@@ -87,11 +107,14 @@ def process_file_into_db(file_path, db_conn, file_type="File"):
                 movie = json.loads(line)
                 movie_id = movie.get("id")
                 if not movie_id: continue
-                
+
+                # Исправляем пустые структуры
+                movie = fix_empty_structs(movie)
+
                 updated_at_str = movie.get("updatedAt")
                 updated_at_ts = parse_iso_date_to_timestamp(updated_at_str)
                 movie_data_json = json.dumps(movie, ensure_ascii=False)
-                
+
                 batch.append((movie_id, updated_at_ts, movie_data_json))
 
                 if len(batch) >= BATCH_SIZE:
@@ -107,12 +130,12 @@ def process_file_into_db(file_path, db_conn, file_type="File"):
         db_conn.commit()
 
 def full_repo_cleanup(api, hf_token, dataset_id, consolidated_file_path):
-    """Выполняет полную очистку репозитория, сохраняя только консолидированный файл."""
+    """Выполняет полную очистку репозитория, сохраняя только консолидированный файл и важные файлы."""
     logging.info("Performing full repository cleanup to remove history and reduce storage usage...")
-    
+
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
-        
+
         # Создаем новый временный репозиторий
         temp_repo_name = f"{dataset_id}_temp"
         try:
@@ -123,16 +146,16 @@ def full_repo_cleanup(api, hf_token, dataset_id, consolidated_file_path):
                 api.delete_repo(repo_id=temp_repo_name, repo_type="dataset")
             except:
                 pass
-                
+
             # Создаем новый чистый репозиторий
             logging.info(f"Creating new temporary repository: {temp_repo_name}")
             create_repo(repo_id=temp_repo_name, repo_type="dataset", token=hf_token)
-            
+
             # Копируем консолидированный файл во временную директорию
             temp_file_path = temp_dir_path / "consolidated" / CONSOLIDATED_FILENAME
             os.makedirs(temp_file_path.parent, exist_ok=True)
             shutil.copy2(consolidated_file_path, temp_file_path)
-            
+
             # Загружаем файл во временный репозиторий
             logging.info(f"Uploading consolidated file to temporary repository")
             api.upload_file(
@@ -141,15 +164,40 @@ def full_repo_cleanup(api, hf_token, dataset_id, consolidated_file_path):
                 repo_id=temp_repo_name,
                 repo_type="dataset"
             )
-            
+
+            # Сохраняем важные файлы (README.md и другие)
+            preserved_files = {}
+            for file_to_preserve in FILES_TO_PRESERVE:
+                try:
+                    logging.info(f"Attempting to preserve {file_to_preserve}")
+                    local_path = hf_hub_download(
+                        repo_id=dataset_id, 
+                        filename=file_to_preserve, 
+                        repo_type="dataset", 
+                        token=hf_token
+                    )
+                    with open(local_path, 'rb') as f:
+                        preserved_files[file_to_preserve] = f.read()
+
+                    # Загружаем важный файл во временный репозиторий
+                    api.upload_file(
+                        path_or_fileobj=local_path,
+                        path_in_repo=file_to_preserve,
+                        repo_id=temp_repo_name,
+                        repo_type="dataset"
+                    )
+                    logging.info(f"Successfully preserved {file_to_preserve}")
+                except Exception as e:
+                    logging.warning(f"Could not preserve {file_to_preserve}: {e}")
+
             # Удаляем оригинальный репозиторий
             logging.info(f"Deleting original repository: {dataset_id}")
             api.delete_repo(repo_id=dataset_id, repo_type="dataset")
-            
+
             # Создаем новый чистый репозиторий с оригинальным именем
             logging.info(f"Creating new clean repository: {dataset_id}")
             create_repo(repo_id=dataset_id, repo_type="dataset", token=hf_token)
-            
+
             # Загружаем консолидированный файл в новый репозиторий
             logging.info(f"Uploading consolidated file to new clean repository")
             api.upload_file(
@@ -158,14 +206,28 @@ def full_repo_cleanup(api, hf_token, dataset_id, consolidated_file_path):
                 repo_id=dataset_id,
                 repo_type="dataset"
             )
-            
+
+            # Восстанавливаем важные файлы в новый репозиторий
+            for file_name, content in preserved_files.items():
+                temp_file = temp_dir_path / file_name
+                with open(temp_file, 'wb') as f:
+                    f.write(content)
+
+                logging.info(f"Restoring {file_name} to new repository")
+                api.upload_file(
+                    path_or_fileobj=str(temp_file),
+                    path_in_repo=file_name,
+                    repo_id=dataset_id,
+                    repo_type="dataset"
+                )
+
             # Удаляем временный репозиторий
             logging.info(f"Deleting temporary repository: {temp_repo_name}")
             api.delete_repo(repo_id=temp_repo_name, repo_type="dataset")
-            
+
             logging.info("Full repository cleanup completed successfully")
             return True
-            
+
         except Exception as e:
             logging.error(f"Error during full repository cleanup: {e}", exc_info=True)
             return False
@@ -174,7 +236,7 @@ def main():
     hf_token = get_required_env_var("HF_TOKEN")
     api = HfApi(token=hf_token)
     db_conn = setup_database(DB_FILENAME)
-    
+
     consolidated_repo_path = f"{CONSOLIDATED_DIR}/{CONSOLIDATED_FILENAME}"
     try:
         logging.info(f"Attempting to download main consolidated file: {consolidated_repo_path}...")
@@ -189,14 +251,14 @@ def main():
             logging.error(f"HTTP error downloading main file: {e}", exc_info=True)
             db_conn.close()
             sys.exit(1)
-    
+
     try:
         raw_files_in_repo = [f for f in api.list_repo_files(repo_id=DATASET_ID, repo_type="dataset") if f.startswith(f"{RAW_DATA_DIR}/")]
     except Exception as e:
         logging.critical(f"Could not list repo files. Error: {e}", exc_info=True)
         db_conn.close()
         sys.exit(1)
-    
+
     if raw_files_in_repo:
         logging.info(f"Found {len(raw_files_in_repo)} raw files to consolidate.")
         for file_path in raw_files_in_repo:
@@ -205,14 +267,14 @@ def main():
                 process_file_into_db(local_raw_path, db_conn, file_type="Raw")
             except Exception as e:
                 logging.error(f"Failed to process raw file {file_path}: {e}", exc_info=True)
-    
+
     output_dir = Path("output_consolidated")
     output_dir.mkdir(exist_ok=True)
     final_archive_path = output_dir / CONSOLIDATED_FILENAME
     cursor = db_conn.cursor()
     cursor.execute("SELECT COUNT(id) FROM movies")
     total_unique_movies = cursor.fetchone()[0]
-    
+
     if total_unique_movies == 0:
         logging.warning("Database is empty. Nothing to upload. Exiting.")
         db_conn.close()
@@ -226,7 +288,11 @@ def main():
         while True:
             rows = cursor.fetchmany(BATCH_SIZE)
             if not rows: break
-            for row in rows: f.write(row[0] + '\n')
+            for row in rows: 
+                # Дополнительная проверка и исправление перед записью
+                movie_data = json.loads(row[0])
+                movie_data = fix_empty_structs(movie_data)
+                f.write(json.dumps(movie_data, ensure_ascii=False) + '\n')
     db_conn.close()
 
     # Если есть raw-файлы или установлен флаг принудительной очистки,
@@ -266,7 +332,7 @@ def main():
         except Exception as e:
             logging.critical(f"CRITICAL: Failed to upload new consolidated file: {e}", exc_info=True)
             sys.exit(1)
-    
+
     if os.path.exists(DB_FILENAME):
         os.remove(DB_FILENAME)
     logging.info("\nConsolidation run completed successfully.")
