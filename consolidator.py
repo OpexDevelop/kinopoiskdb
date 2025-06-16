@@ -68,24 +68,6 @@ def setup_database(db_path):
     db_conn.commit()
     return db_conn
 
-def fix_empty_structs(movie_data):
-    """Исправляет пустые структуры в данных фильма."""
-    if isinstance(movie_data, dict):
-        # Исправляем пустые структуры
-        for key, value in list(movie_data.items()):
-            if isinstance(value, dict) and not value:
-                # Заменяем пустые объекты на null
-                movie_data[key] = None
-            elif isinstance(value, dict):
-                # Рекурсивно обрабатываем вложенные объекты
-                fix_empty_structs(value)
-            elif isinstance(value, list):
-                # Обрабатываем элементы списка
-                for item in value:
-                    if isinstance(item, dict):
-                        fix_empty_structs(item)
-    return movie_data
-
 def process_file_into_db(file_path, db_conn, file_type="File"):
     """Читает файл .jsonl.gz и вставляет/обновляет данные в БД, избегая перезаписи более свежих данных старыми."""
     logging.info(f"Processing {file_type} into database: {Path(file_path).name}...")
@@ -107,9 +89,6 @@ def process_file_into_db(file_path, db_conn, file_type="File"):
                 movie = json.loads(line)
                 movie_id = movie.get("id")
                 if not movie_id: continue
-
-                # Исправляем пустые структуры
-                movie = fix_empty_structs(movie)
 
                 updated_at_str = movie.get("updatedAt")
                 updated_at_ts = parse_iso_date_to_timestamp(updated_at_str)
@@ -288,11 +267,7 @@ def main():
         while True:
             rows = cursor.fetchmany(BATCH_SIZE)
             if not rows: break
-            for row in rows: 
-                # Дополнительная проверка и исправление перед записью
-                movie_data = json.loads(row[0])
-                movie_data = fix_empty_structs(movie_data)
-                f.write(json.dumps(movie_data, ensure_ascii=False) + '\n')
+            for row in rows: f.write(row[0] + '\n')
     db_conn.close()
 
     # Если есть raw-файлы или установлен флаг принудительной очистки,
