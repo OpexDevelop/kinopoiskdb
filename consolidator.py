@@ -175,7 +175,8 @@ def main():
     if raw_files_in_repo:
         logging.info(f"Deleting {len(raw_files_in_repo)} processed raw files...")
         try:
-            api.delete_files(repo_id=DATASET_ID, repo_type="dataset", paths_in_repo=raw_files_in_repo)
+            # FIX: Changed 'paths_in_repo' to 'paths'
+            api.delete_files(repo_id=DATASET_ID, repo_type="dataset", paths=raw_files_in_repo)
             logging.info("Successfully deleted raw files.")
         except Exception as e:
             logging.error(f"Could not delete raw files. Please delete them manually. Error: {e}")
@@ -186,5 +187,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
