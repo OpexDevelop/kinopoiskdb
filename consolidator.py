@@ -4,10 +4,13 @@ import json
 import sys
 import logging
 import sqlite3
+import tempfile
+import shutil
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, create_repo
 from huggingface_hub.utils import HfFolder
 from huggingface_hub.errors import HfHubHTTPError
 
@@ -19,6 +22,7 @@ CONSOLIDATED_DIR = "consolidated"
 CONSOLIDATED_FILENAME = "kinopoisk.jsonl.gz"
 DB_FILENAME = "consolidation_db.sqlite"
 BATCH_SIZE = 5000
+FORCE_FULL_CLEANUP = True  # Установите True для принудительной очистки
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -102,6 +106,70 @@ def process_file_into_db(file_path, db_conn, file_type="File"):
         cursor.executemany(sql_upsert, batch)
         db_conn.commit()
 
+def full_repo_cleanup(api, hf_token, dataset_id, consolidated_file_path):
+    """Выполняет полную очистку репозитория, сохраняя только консолидированный файл."""
+    logging.info("Performing full repository cleanup to remove history and reduce storage usage...")
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        
+        # Создаем новый временный репозиторий
+        temp_repo_name = f"{dataset_id}_temp"
+        try:
+            # Проверяем существует ли временный репозиторий и удаляем его если существует
+            try:
+                api.repo_info(repo_id=temp_repo_name, repo_type="dataset")
+                logging.info(f"Deleting existing temporary repository: {temp_repo_name}")
+                api.delete_repo(repo_id=temp_repo_name, repo_type="dataset")
+            except:
+                pass
+                
+            # Создаем новый чистый репозиторий
+            logging.info(f"Creating new temporary repository: {temp_repo_name}")
+            create_repo(repo_id=temp_repo_name, repo_type="dataset", token=hf_token)
+            
+            # Копируем консолидированный файл во временную директорию
+            temp_file_path = temp_dir_path / "consolidated" / CONSOLIDATED_FILENAME
+            os.makedirs(temp_file_path.parent, exist_ok=True)
+            shutil.copy2(consolidated_file_path, temp_file_path)
+            
+            # Загружаем файл во временный репозиторий
+            logging.info(f"Uploading consolidated file to temporary repository")
+            api.upload_file(
+                path_or_fileobj=str(temp_file_path),
+                path_in_repo=f"consolidated/{CONSOLIDATED_FILENAME}",
+                repo_id=temp_repo_name,
+                repo_type="dataset"
+            )
+            
+            # Удаляем оригинальный репозиторий
+            logging.info(f"Deleting original repository: {dataset_id}")
+            api.delete_repo(repo_id=dataset_id, repo_type="dataset")
+            
+            # Создаем новый чистый репозиторий с оригинальным именем
+            logging.info(f"Creating new clean repository: {dataset_id}")
+            create_repo(repo_id=dataset_id, repo_type="dataset", token=hf_token)
+            
+            # Загружаем консолидированный файл в новый репозиторий
+            logging.info(f"Uploading consolidated file to new clean repository")
+            api.upload_file(
+                path_or_fileobj=str(temp_file_path),
+                path_in_repo=f"consolidated/{CONSOLIDATED_FILENAME}",
+                repo_id=dataset_id,
+                repo_type="dataset"
+            )
+            
+            # Удаляем временный репозиторий
+            logging.info(f"Deleting temporary repository: {temp_repo_name}")
+            api.delete_repo(repo_id=temp_repo_name, repo_type="dataset")
+            
+            logging.info("Full repository cleanup completed successfully")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error during full repository cleanup: {e}", exc_info=True)
+            return False
+
 def main():
     hf_token = get_required_env_var("HF_TOKEN")
     api = HfApi(token=hf_token)
@@ -161,25 +229,43 @@ def main():
             for row in rows: f.write(row[0] + '\n')
     db_conn.close()
 
-    try:
-        logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
-        api.upload_file(
-            path_or_fileobj=str(final_archive_path),
-            path_in_repo=consolidated_repo_path,
-            repo_id=DATASET_ID, repo_type="dataset"
-        )
-    except Exception as e:
-        logging.critical(f"CRITICAL: Failed to upload new consolidated file: {e}", exc_info=True)
-        sys.exit(1)
+    # Если есть raw-файлы или установлен флаг принудительной очистки,
+    # выполняем полную очистку репозитория
+    if raw_files_in_repo or FORCE_FULL_CLEANUP:
+        if full_repo_cleanup(api, hf_token, DATASET_ID, final_archive_path):
+            logging.info("Repository has been completely cleaned up with history removal.")
+        else:
+            # Если полная очистка не удалась, пробуем обычный метод загрузки и удаления
+            try:
+                logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
+                api.upload_file(
+                    path_or_fileobj=str(final_archive_path),
+                    path_in_repo=consolidated_repo_path,
+                    repo_id=DATASET_ID, repo_type="dataset"
+                )
+            except Exception as e:
+                logging.critical(f"CRITICAL: Failed to upload new consolidated file: {e}", exc_info=True)
+                sys.exit(1)
 
-    if raw_files_in_repo:
-        logging.info(f"Deleting {len(raw_files_in_repo)} processed raw files...")
+            if raw_files_in_repo:
+                logging.info(f"Deleting {len(raw_files_in_repo)} processed raw files...")
+                try:
+                    api.delete_files(repo_id=DATASET_ID, repo_type="dataset", path_or_paths=raw_files_in_repo)
+                    logging.info("Successfully deleted raw files.")
+                except Exception as e:
+                    logging.error(f"Could not delete raw files. Please delete them manually. Error: {e}")
+    else:
+        # Обычный режим загрузки без полной очистки
         try:
-            # FIX: Changed 'paths_in_repo' to 'paths'
-            api.delete_files(repo_id=DATASET_ID, repo_type="dataset", paths=raw_files_in_repo)
-            logging.info("Successfully deleted raw files.")
+            logging.info(f"Uploading new consolidated file to {consolidated_repo_path}...")
+            api.upload_file(
+                path_or_fileobj=str(final_archive_path),
+                path_in_repo=consolidated_repo_path,
+                repo_id=DATASET_ID, repo_type="dataset"
+            )
         except Exception as e:
-            logging.error(f"Could not delete raw files. Please delete them manually. Error: {e}")
+            logging.critical(f"CRITICAL: Failed to upload new consolidated file: {e}", exc_info=True)
+            sys.exit(1)
     
     if os.path.exists(DB_FILENAME):
         os.remove(DB_FILENAME)
@@ -187,4 +273,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
